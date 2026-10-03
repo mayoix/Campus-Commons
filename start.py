@@ -5,10 +5,10 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import secrets
 import socket
 import subprocess
 import sys
-import threading
 import time
 import urllib.request
 import venv
@@ -33,13 +33,15 @@ def configuration():
 
 
 def check_configuration(values):
-    required = ('SUPABASE_DATABASE_URL', 'SUPABASE_URL', 'CAMPUS_ADMIN_PASSWORD')
+    required = ('SUPABASE_DATABASE_URL', 'SUPABASE_URL')
     missing = [key for key in required if not values.get(key)]
     if not (values.get('SUPABASE_SECRET_KEY') or values.get('SUPABASE_SERVICE_ROLE_KEY')):
         missing.append('SUPABASE_SECRET_KEY')
     if missing:
         raise ValueError('Place the private .env supplied by the project owner next to start.py. Missing: ' + ', '.join(missing))
     checked = [values[key] for key in required]
+    if values.get('CAMPUS_ADMIN_PASSWORD'):
+        checked.append(values['CAMPUS_ADMIN_PASSWORD'])
     checked.append(values.get('SUPABASE_SECRET_KEY') or values.get('SUPABASE_SERVICE_ROLE_KEY'))
     if any(marker in value.lower() for value in checked for marker in ('replace_me', 'replace_with_', 'your-project', 'your_database_password', 'your_session_pooler', '<your', '[your')):
         raise ValueError('The configuration still contains examples. Ask the owner for a completed private .env.')
@@ -52,6 +54,24 @@ def check_configuration(values):
     except ValueError:
         raise ValueError('PORT must be a number from 1 to 65535.') from None
     return port
+
+
+def ensure_admin_password(values):
+    if values.get('CAMPUS_ADMIN_PASSWORD'):
+        return
+    path = ROOT / '.launcher-admin-password'
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        pass
+    else:
+        with os.fdopen(fd, 'w', encoding='utf-8') as output:
+            output.write(secrets.token_urlsafe(24) + '\n')
+    password = path.read_text(encoding='utf-8').strip()
+    if not password:
+        raise RuntimeError('The local .launcher-admin-password file is empty. Set CAMPUS_ADMIN_PASSWORD in your private .env.')
+    values['CAMPUS_ADMIN_PASSWORD'] = password
+    print('Local admin password: open .launcher-admin-password in this project folder to view it privately.', flush=True)
 
 
 def prepare_python():
@@ -86,13 +106,10 @@ def launch(python, values, port):
     values = dict(values, CAMPUS_DB_BACKEND='supabase', PORT=str(port))
     child = subprocess.Popen(
         [str(python), '-u', str(ROOT / 'server.py')], cwd=ROOT, env=values,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
-    # Drain output without retaining/logging exception text that may contain DSNs.
-    def discard_output():
-        for _ in child.stdout:
-            pass
-    threading.Thread(target=discard_output, daemon=True).start()
+    # Discard potentially sensitive bytes directly without decoding Windows
+    # GBK/UTF-8 output or retaining credential-bearing exception text.
     url = f'http://127.0.0.1:{port}/'
     # Local readiness must not go through a user's HTTP proxy.
     client = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -132,7 +149,6 @@ def launch(python, values, port):
             except subprocess.TimeoutExpired:
                 child.kill()
                 child.wait()
-        child.stdout.close()
 
 
 def main():
@@ -141,6 +157,7 @@ def main():
             raise RuntimeError('Install Python 3.10 or newer, then double-click the launcher again.')
         values = configuration()
         port = check_configuration(values)
+        ensure_admin_password(values)
         return launch(prepare_python(), values, port)
     except KeyboardInterrupt:
         print('\nStopped.')

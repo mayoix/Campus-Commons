@@ -108,7 +108,9 @@ def main() -> int:
             print('FAIL Storage: check HTTPS access, DNS, proxy and trusted TLS certificates.')
             errors += 1
 
-    if placeholder(os.environ.get('CAMPUS_ADMIN_PASSWORD', '')):
+    if not os.environ.get('CAMPUS_ADMIN_PASSWORD'):
+        print('INFO the double-click launcher will generate/reuse a local admin password. Set CAMPUS_ADMIN_PASSWORD for direct server.py startup.')
+    elif placeholder(os.environ['CAMPUS_ADMIN_PASSWORD']):
         print('FAIL set a new private CAMPUS_ADMIN_PASSWORD in .env; do not use the historical repository password.')
         errors += 1
     if errors:

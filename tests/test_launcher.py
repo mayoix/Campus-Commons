@@ -40,6 +40,30 @@ class LauncherTests(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(ValueError):
                 launcher.check_configuration(values)
 
+    def test_legacy_env_generates_and_reuses_private_admin_password(self):
+        values = self.values()
+        values.pop('CAMPUS_ADMIN_PASSWORD')
+        self.assertEqual(launcher.check_configuration(values), 8765)
+        with tempfile.TemporaryDirectory() as directory, patch.object(launcher, 'ROOT', Path(directory)), contextlib.redirect_stdout(io.StringIO()) as output:
+            launcher.ensure_admin_password(values)
+            password = values['CAMPUS_ADMIN_PASSWORD']
+            self.assertGreaterEqual(len(password), 32)
+            second = {}
+            launcher.ensure_admin_password(second)
+            self.assertEqual(second['CAMPUS_ADMIN_PASSWORD'], password)
+            self.assertNotIn(password, output.getvalue())
+            path = Path(directory) / '.launcher-admin-password'
+            self.assertEqual(path.read_text().strip(), password)
+            if os.name != 'nt':
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_explicit_admin_password_is_preserved(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(launcher, 'ROOT', Path(directory)):
+            values = self.values()
+            launcher.ensure_admin_password(values)
+            self.assertEqual(values['CAMPUS_ADMIN_PASSWORD'], 'test-only-admin')
+            self.assertFalse((Path(directory) / '.launcher-admin-password').exists())
+
     def test_occupied_port_does_not_launch_another_server(self):
         with socket.socket() as listener, patch.object(launcher.subprocess, 'Popen') as popen:
             listener.bind(('127.0.0.1', 0))
@@ -51,7 +75,12 @@ class LauncherTests(unittest.TestCase):
     def test_browser_opens_only_after_child_serves_bootstrap(self):
         # A real local HTTP child exercises readiness/lifecycle, not cloud behavior.
         with tempfile.TemporaryDirectory() as directory, patch.object(launcher, 'ROOT', Path(directory)), patch.object(launcher.webbrowser, 'open', return_value=True) as browser, contextlib.redirect_stdout(io.StringIO()):
-            (Path(directory) / 'server.py').write_text('''import os
+            (Path(directory) / 'server.py').write_text('''import os, sys
+# These bytes are invalid in GBK and UTF-8; exceed a normal pipe buffer too.
+sys.stdout.buffer.write(bytes([0xff, 0xad, 0x81]) * 100000)
+sys.stdout.buffer.flush()
+sys.stderr.buffer.write(bytes([0xff, 0xad, 0x81]) * 100000)
+sys.stderr.buffer.flush()
 from http.server import HTTPServer, BaseHTTPRequestHandler
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):

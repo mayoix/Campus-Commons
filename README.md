@@ -35,6 +35,8 @@ The launcher creates `.venv`, installs the pinned cloud driver on first use, sta
 
 If macOS blocks opening the downloaded command, use Finder's **Open** option for the file you trust. If executable permission was lost while extracting, run `chmod +x "Start Campus Commons.command"` once, or use `python3 start.py` from a terminal. Windows users should extract the folder before double-clicking, not run from inside the ZIP viewer. Startup does not require administrator rights.
 
+If `CAMPUS_ADMIN_PASSWORD` is absent in an older private `.env`, the launcher automatically generates a local password in `.launcher-admin-password` and reuses it on later launches. Open that hidden file privately when you need admin login; the password is not printed or committed. A supplied `CAMPUS_ADMIN_PASSWORD` still takes priority. Direct `server.py` startup does not use this launcher fallback.
+
 A missing/incomplete `.env`, occupied port or failed cloud startup produces a short message and leaves the error window open. The launcher never copies credentials into code, migrates the SQLite data to Supabase, or silently switches to SQLite. Normal application startup can still initialize/backfill schema/history. It does not test evidence uploads; those happen when used in the app. Connection checks below are optional troubleshooting tools, not a daily startup requirement.
 
 **Owner's simplest handoff:** privately send the trusted collaborator a folder/package containing this source version plus the completed test `.env`, using the encrypted delivery method below. Exclude `.git`, `.venv`, local backups and your historical `.admin-password`; do not omit the tracked demo SQLite file if you want the optional offline demo. Never publish a configured package on GitHub. Alternatively, let collaborators download GitHub's ZIP and privately send just `.env` once. Keep automatic scheduling Manual and prepare the shared database once before distributing the package.
@@ -115,7 +117,7 @@ Windows PowerShell:
 .\.venv\Scripts\python.exe scripts/check_connection.py
 ```
 
-The check loads the root `.env`, verifies PostgreSQL authentication and TLS, reads all 13 application tables, checks that organizations/admin configuration exist, checks that automatic scheduling is off, and authenticates to Storage to find the private evidence bucket. It also checks that a private admin-password override is configured. It prints no keys, passwords or raw server errors. A failure returns a nonzero exit code; it never migrates, writes rows, creates buckets or starts the scheduler.
+The check loads the root `.env`, verifies PostgreSQL authentication and TLS, reads all 13 application tables, checks that organizations/admin configuration exist, checks that automatic scheduling is off, and authenticates to Storage to find the private evidence bucket. It rejects placeholder admin passwords; if no override is set, it explains the launcher-generated password option. It prints no keys, passwords or raw server errors. A failure returns a nonzero exit code; it never migrates, writes rows, creates buckets or starts the scheduler.
 
 Expected final message: `Read-only preflight passed.` This establishes connectivity and reads, **not** database writes, evidence upload permissions or UI behavior. Complete the two-person test below as well. If you run these diagnostics, resolve failures with the owner; double-click startup does not require this separate step.
 
@@ -309,7 +311,7 @@ Share only the check's PASS/FAIL lines when asking for help. Never share `.env`,
 
 ## Validation status
 
-The launcher and read-only diagnostic have 12 passing automated tests. Launcher readiness, browser-opening timing, child-process cleanup and safe failure paths were tested on Linux, along with real first-time dependency installation and reuse. Windows/macOS launch wrappers have not been run on their native operating systems. Earlier cloud checks in the onboarding environment were blocked by DNS/egress restrictions; no successful live cloud connection or migration from that environment is claimed. Each collaborator must run the preflight on their own network and complete the two-person acceptance test. The owner reports their own local cloud connection works; that does not establish access from other networks.
+The launcher and read-only diagnostic have 14 passing automated tests. Launcher readiness, browser-opening timing, child-process cleanup and safe failure paths were tested on Linux, along with real first-time dependency installation and reuse. Windows/macOS launch wrappers have not been run on their native operating systems. Earlier cloud checks in the onboarding environment were blocked by DNS/egress restrictions; no successful live cloud connection or migration from that environment is claimed. Each collaborator must run the preflight on their own network and complete the two-person acceptance test. The owner reports their own local cloud connection works; that does not establish access from other networks.
 
 ## Implementation decisions
 
