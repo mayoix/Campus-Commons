@@ -1,61 +1,305 @@
 # Campus Commons
 
-Campus Commons 是根据题目文件和项目题目文档实现的本地全栈 MVP。用户端用于发布 Mission、浏览/上传资源、维护本组织资源和确认使用结果；管理端用于批次调度、组织与资源管理、公平分配测试及隔离 Demo。
+Campus Commons is a full-stack MVP for sharing campus resources between organizations. Organizations can publish equipment, spaces, skills, and people resources; submit Missions; choose acceptable options; and receive an allocation after the application window closes.
 
-## 启动
+The repository includes:
 
-需要 Python 3.10+，不需要安装第三方依赖：
+- A user app for publishing resources, submitting Missions, managing an organization profile, checking approved results, and reporting disputes.
+- An administrator console opened from the user app. It manages resources, organizations, allocation batches, disputes, credit events, and explainable demo scenarios.
+- Persistent history for resources, Missions, bookings, decisions, disputes, credit events, contribution events, and platform changes.
+- A SQLite demo database for an offline local run.
+- A Supabase Postgres + Supabase Storage mode for a shared cloud database and cloud evidence files.
+
+## What users see
+
+The user app keeps the wording short and practical:
+
+- The resource directory can be sorted by status, availability time (earliest first), location (A–Z), or price (low to high).
+- Mission submission only asks for the title, need, location, and use time. The server calculates the application deadline.
+- The organization profile shows contribution, credit, history, and resources owned by the current organization. Owners can edit their own resource details, availability, and status.
+- Users see the final Mission/resource result. Fairness weights, batch internals, and administrator controls stay in the admin console.
+- Recent activity is filtered to the current organization.
+- A user can report a dispute and upload evidence. When an approved compensation dispute is resolved by the affected organization, the provider account is unfrozen.
+
+## Quick start for trusted collaborators
+
+A clone alone cannot connect to the shared database: the owner must supply a valid private `.env`, prepare the cloud schema/data and allow your network to reach Supabase. Use a **separate Supabase test project**. Everyone using it can change the same test data. Ordinary end users should use a hosted backend instead of receiving these credentials.
+
+These instructions are on `main` **after** the `v2.0.0` tag. Clone `main`; that older tag does not contain the preflight script or dependency file below. Python 3.10+ and Git are required. Downloading **Code → Download ZIP** and extracting it is also supported; run commands in the folder containing `server.py`.
+
+### 1. Download and install
+
+macOS/Linux:
 
 ```bash
-PORT=8765 python3 server.py
+git clone https://github.com/mayoix/campus-commons.git
+cd campus-commons
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements-cloud.txt
 ```
 
-打开 <http://127.0.0.1:8765/>。仓库包含当前的 `campus_commons.sqlite3` 演示数据，启动时只做增量迁移，不会用快照覆盖已有记录。资源、Mission、预约、决策、争议、信用事件、贡献事件和历史日志都会在每次写入后提交到数据库，重启服务后仍然存在。
+Windows PowerShell:
 
-默认数据库是项目根目录的 SQLite 文件；部署时可用 `CAMPUS_DB_PATH=/persistent/path/campus_commons.sqlite3` 指向持久磁盘。配置 `SUPABASE_DATABASE_URL` 并运行 `python3 scripts/migrate_sqlite_to_supabase.py --yes` 后，服务端会把业务读写切换到共享的 Supabase Postgres，所有客户端和管理端看到同一份数据；本地 SQLite 仍保留作为回滚和演示备份。启动前会生成时间戳备份。不要通过删除数据库来重置正式演示数据。
+```powershell
+git clone https://github.com/mayoix/campus-commons.git
+cd campus-commons
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements-cloud.txt
+```
 
-### Supabase 云端证据配置
+No activation or PowerShell execution-policy change is needed. The pinned driver includes its binary dependencies.
 
-项目支持从根目录 `.env` 读取 `SUPABASE_URL`、`SUPABASE_SECRET_KEY` 和可选的 `SUPABASE_EVIDENCE_BUCKET`。复制 `.env.example` 为 `.env`，填入 Supabase 项目 URL 与服务器端 Secret key 后重启即可；Secret key 只在后端使用，不能提交到仓库。完整的图文步骤与当前边界见 [SUPABASE_SETUP.md](SUPABASE_SETUP.md)。当前实现会把争议证据文件写入私有 Supabase Storage，同时保留本地 SQLite 业务数据；Mission、资源、组织、预约和历史表迁移到 Supabase Postgres 需要单独执行迁移并验证，不能仅凭配置变量宣称已经完成。
+### 2. Receive the owner's private configuration
 
-## 用户端
+Ask the owner for the **test project's** `.env` using the delivery procedure below. Place it next to `server.py`, not in `static/` or `scripts/`. If creating it yourself, copy `.env.example` and replace every placeholder:
 
-- 用户会话用本地演示组织切换模拟，不在请求参数中信任组织 ID。
-- 资源池默认使用“状态排序”，另有时间早到晚、位置 A-Z、价格低到高。
-- “组织档案”只管理当前组织自己的资源，可修改内容、可用时间和 `available / offline / maintenance` 状态。
-- Mission 提交只保留标题、需求、地点和使用时间；截止时间由服务端按开始时间前 24 小时计算。
-- 截止前只能调整可接受方案顺序；到期后由管理端批次执行，用户不会看到 batch、权重或决策过程。
-- 用户只能看到当前组织相关活动，以及“Mission / 设备 / 场地已获批”等结果通知。
-- Mission 详情可以发起争议；实际金额赔偿必须填写金额并上传证据。管理员审批通过后，违约组织自动扣信用并冻结，受害组织在确认处理完成后点击“已经解决”，系统才会解除冻结。
-- 组织档案会显示本组织的历史记录；资源和 Mission 的创建、编辑、方案偏好、获批、候补、替换和完成状态都会留下不可变日志。
-- 用户端每 5 秒读取数据库版本号；发现管理端或其他会话有新写入时，只重新读取数据库，不维护第二套前端数据源。
-- 资源上传中的“平台无法匹配时的采购 / 租赁成本”用于估算外部替代开支；成本参考来源改为下拉选项（公开报价、校内费率、校内公开费率、校外市场报价、历史成交价、组织估算、其他），选择“其他”时可补充说明。
+```bash
+# macOS/Linux; only if you have not already received .env
+cp .env.example .env
+```
 
-## 管理端
+```powershell
+# Windows; only if you have not already received .env
+Copy-Item .env.example .env
+```
 
-管理端不使用另一个网站地址，而是从原网站按 `Alt + Shift + A` 打开浮层。普通用户页面默认不会显示入口，管理端仍需要管理员密码。
+Enable filename extensions in Windows Explorer and verify it is `.env`, not `.env.txt`. Never overwrite an existing working `.env` without saving a private backup outside Git. On macOS, Command + Shift + Period shows hidden files; on Linux use Ctrl + H.
 
-首次运行会在项目根目录生成 `.admin-password`。当前本地实例密码由该文件提供；也可以用 `CAMPUS_ADMIN_PASSWORD` 覆盖。进入后可：
+Required configuration (examples only, never real credentials in this document):
 
-- 运行到期批次，检查时间/容量冲突、偏好顺序、公平分数、候补和预约；
-- 管理组织信用、资源生命周期状态、Mission 使用/归还和争议；
-- 在“冲突与争议”中查看受害方、违约方、赔偿金额、证据文件、扣分和冻结状态；确认违约或驳回后，系统把处理结果写入历史记录。
-- 调整调度器与公平策略（仅管理端可见）；
-- 运行隔离 Demo，演示资源发布、冲突、公平分配、候补、撤回释放、no-show 和替代方案确认。管理端提供“运行全部场景 / 冲突与公平 / 撤回释放 / 违约替换 / 偏好顺序”五个入口；每次报告用时间线、batch 时钟、fairness 输入与总分、状态节点和可验证断言解释底层逻辑。报告保存到 `demo_runs`，不污染正式业务数据。
-- “持久化历史”标签查看所有资源、Mission、争议和平台变更；`decisions` 会保存当次 fairness 各组成分、提交的偏好顺序、策略快照、选中方案和解释。
+```dotenv
+SUPABASE_URL=https://your-project-ref.supabase.co
+SUPABASE_SECRET_KEY=sb_secret_replace_me
+SUPABASE_EVIDENCE_BUCKET=campus-evidence
+SUPABASE_DATABASE_URL=postgresql://postgres.your-project-ref:YOUR_DATABASE_PASSWORD@YOUR_SESSION_POOLER_HOST:5432/postgres?sslmode=verify-full&sslrootcert=system
+CAMPUS_DB_BACKEND=supabase
+CAMPUS_ADMIN_PASSWORD=replace_with_a_new_private_admin_password
+PORT=8765
+```
 
-默认调度器是手动模式；只有在管理端打开自动调度并保持服务进程运行时，后台线程才会按间隔处理到期 Mission。
+Use the actual **Session pooler** URI from Supabase **Connect**; do not guess its region, hostname or username. Session pooling is compatible with typical IPv4 networks. URL-encode only the password component if it contains `@`, `:`, `/`, `#`, `%` or other reserved characters. Do not paste passwords into online encoders. Keep TLS certificate/hostname verification enabled; the bundled modern PostgreSQL client supports `sslrootcert=system`. If a trusted CA file is required on your system, obtain it from the provider and use its path instead. Append parameters with `&` if the URI already contains `?`.
 
-## 关键业务 API
+The Storage URL, server key and database URI must all belong to the same test project. A publishable/anon key is not a replacement for this MVP's server key. Set a new private administrator password: an older `.admin-password` is already tracked in repository history and is **not a secret**. The environment override takes precedence.
 
-用户 API：`GET /api/bootstrap`、`GET /api/history`、`POST /api/resources`、`PATCH /api/resources/:id`、`POST /api/missions`、`POST /api/missions/:id/preferences`、`POST /api/missions/:id/{checkout,complete,withdraw}`、`POST /api/missions/:id/disputes`、`POST /api/disputes/:id/resolve`。`bootstrap.version` 是用户端和管理端共享的数据库变更令牌。
+Shell environment variables override `.env`. If an old configuration persists, use a fresh terminal or unset the old `SUPABASE_*`/`CAMPUS_DB_BACKEND` values and restart. `CAMPUS_DB_PATH` is read before `.env` in this version; if you need that optional SQLite override, set it in the shell rather than in `.env`.
 
-管理 API 需要独立的 HttpOnly `admin_sid`：`POST /api/admin/login`、`GET /api/admin/bootstrap`、`POST /api/admin/allocation/run`、`POST /api/admin/demo/run`、`PATCH /api/admin/config`。旧的用户端 batch 和单 Mission allocate 接口固定返回 403。管理端也每 5 秒按 `bootstrap.version` 同步一次。
+### 3. Check the connection before starting
 
-## 文档未明确处的实现调整
+macOS/Linux:
 
-- 采用本地 HttpOnly 会话和组织切换来模拟多组织用户；没有声称这是生产级身份认证。
-- 资源预约用 `bookings` 表表达时间和容量，不把“已预约”改成资源生命周期状态。
-- 提供方资源下架会释放预约、将 Mission 标记为待替换；候选替代方案需要用户重新确认。
-- 题目没有规定真实支付、地图、对象存储或外部身份认证，因此本地版本用 SQLite、文本位置和争议记录完成可重复测试。
-- 参考架构建议中的 PostgreSQL/FastAPI/React/WebSocket 需要额外运行时依赖和部署环境；当前交付先完成同等的数据边界：数据库是唯一事实源、历史事件不可变、API 写入后双端自动同步。没有强行引入缺少依赖的栈，以保证本地演示可直接启动。
+```bash
+.venv/bin/python scripts/check_connection.py
+```
+
+Windows PowerShell:
+
+```powershell
+.\.venv\Scripts\python.exe scripts/check_connection.py
+```
+
+The check loads the root `.env`, verifies PostgreSQL authentication and TLS, reads all 13 application tables, checks that organizations/admin configuration exist, checks that automatic scheduling is off, and authenticates to Storage to find the private evidence bucket. It also checks that a private admin-password override is configured. It prints no keys, passwords or raw server errors. A failure returns a nonzero exit code; it never migrates, writes rows, creates buckets or starts the scheduler.
+
+Expected final message: `Read-only preflight passed.` This establishes connectivity and reads, **not** database writes, evidence upload permissions or UI behavior. Complete the two-person test below as well. Do not start the server until failures are resolved with the owner.
+
+### 4. Start and open the platform
+
+macOS/Linux:
+
+```bash
+.venv/bin/python server.py
+```
+
+Windows PowerShell:
+
+```powershell
+.\.venv\Scripts\python.exe server.py
+```
+
+Keep the terminal open and visit <http://127.0.0.1:8765/> on the **same computer**. The startup line must say `(database: supabase)`. Press Ctrl + C to stop. Each collaborator starts their own local server, all connected to the same cloud project; sending your localhost URL to someone else does not share your server.
+
+Open the admin overlay with **Option + Shift + A** on macOS or **Alt + Shift + A** on Windows/Linux and enter `CAMPUS_ADMIN_PASSWORD`. If the shortcut is intercepted, focus the page and check keyboard shortcuts. The admin dashboard should show `Supabase Postgres · Connected`. Its Storage badge only reflects configuration presence; use the preflight and upload test to verify actual access.
+
+**Collaborators must not run `migrate_sqlite_to_supabase.py`.** The existing shared database is already prepared by the owner. Starting the server can initialize/backfill schema and history, so this is not a read-only activity. Current startup requires schema-creation and application read/write privileges; a SELECT-only database role is insufficient.
+
+## Owner: prepare access once
+
+1. Use a separate Supabase project for shared testing. Keep production data and credentials separate. Confirm the project is running and collaborators can reach its HTTPS API (443) and Session pooler (normally TCP 5432). Any configured database IP restrictions must permit their networks. An HTTPS proxy alone may not support PostgreSQL TCP.
+2. Create your private `.env` from the template. Choose a new admin password in a password manager. Use a revocable test-project server key and database credential. Treat every recipient as a backend administrator; hiding the in-page admin button does not limit someone who has these keys.
+3. Prepare the schema and demonstration data **once**. If the cloud database already works, skip migration. For a new/empty test project only, first back up the intended local SQLite source and verify it is the current dataset; the Git-tracked demo database may be older than your working local database. Install `requirements-cloud.txt`, then run `.venv/bin/python scripts/migrate_sqlite_to_supabase.py --yes` (Windows: `.\.venv\Scripts\python.exe scripts/migrate_sqlite_to_supabase.py --yes`). The migration updates existing rows with the same ID using the local values; repeated execution can overwrite newer cloud changes. It is not a safe reset. For an existing populated database, back up the cloud data and compare records before deciding to migrate.
+4. In Supabase Storage create a bucket named `campus-evidence` (or the configured name) with **Public bucket disabled**. The application can create it on first upload, but precreating it makes the read-only preflight meaningful before testing.
+5. With only the owner's server running, open **Demo tests → Scheduler settings**, choose **Manual**, and save. Stop extra servers while changing this. Each running server launches a scheduler thread, while its lock is only local to that process. Leave scheduling manual during collaboration and designate one operator to run batches; do not run batches concurrently on several machines.
+6. Run the preflight and the browser test yourself, then deliver access. Record who received it. On revocation, rotate the distributed database password/server key and update remaining collaborators' private files; deleting a shared link cannot revoke already downloaded credentials.
+
+## Owner: securely deliver `.env`
+
+**Preferred:** share a secure note/file through a password manager with named-recipient access and expiry. Include only the test-project `.env` and the README link. A normal ZIP archive is not encryption. Never put `.env` in a GitHub commit, Issue, PR, Release asset or public download.
+
+**Encrypted archive alternative:** use a trusted 7-Zip-compatible application with **7z format, AES-256 encryption and encrypted filenames**. Install it from its official distribution if needed. Archive creation is a local owner action; no real configuration package is generated or published by this repository.
+
+1. Create a temporary folder **outside the checkout**, such as a private folder on your desktop. Copy only the intended `.env` into it; exclude `.git`, `.admin-password`, SQLite databases, backups and other project files. If you already have a correct `.env`, do not run the template-copy command over it.
+2. Using the application's GUI, select `.env` → **Add to archive** → format **7z** → encryption **AES-256** → **Encrypt file names**. Use a unique strong passphrase saved in your password manager. Choose an output path outside the repository.
+3. If the `7z` command is installed, the equivalent command, run inside that temporary folder, is:
+
+   ```text
+   7z a -t7z -mhe=on -p campus-commons-test-env.7z .env
+   ```
+
+   `-p` prompts interactively; do not append the passphrase to the command or store it in shell history. Run `7z t campus-commons-test-env.7z` and enter the passphrase to verify the archive. Basic OS ZIP tools may not support encrypted 7z extraction; recipients need a compatible tool.
+4. Send the archive through a private recipient-restricted transfer with an expiry. Deliver the passphrase over a separate authenticated channel, such as a phone call or password manager. Verify the recipient identity; do not post both in a shared public channel.
+5. The recipient decrypts it locally, places `.env` next to `server.py`, runs the preflight, and keeps the file private. On macOS/Linux run `chmod 600 .env`. On Windows use an access-controlled user folder and check the file's Security permissions. Remove unnecessary temporary plaintext copies after confirming setup; keep only a protected backup if needed.
+
+Before committing any project changes, run:
+
+```text
+git check-ignore .env
+git ls-files --error-unmatch .env
+```
+
+The first must report `.env`; the second must **fail** because the file must not be tracked. `.gitignore` does not untrack files already committed. Review staged filenames with `git diff --cached --name-only` before pushing. If a real key was committed, rotate it; deleting it in a later commit does not erase history.
+
+## Two-person acceptance test
+
+Use only the shared test project and dummy evidence. Agree on a unique prefix such as `TEST-A-20261003` so test records are identifiable.
+
+1. Both collaborators run the preflight, start their servers, and confirm the Supabase backend. Use a healthy demo organization; keep the scheduler manual.
+2. Person A publishes an available resource with the prefix and a future availability window. Person B waits at least five seconds (or refreshes) and confirms that the same named resource appears on their computer. A changes its description/location, and B confirms the updated value. This proves shared reads and writes rather than two isolated SQLite demos.
+3. B switches to a different demo organization and submits a Mission for that resource's available time. The designated administrator confirms it appears in their Mission list/history. User Mission lists are scoped to their current organization, so A's ordinary user view need not show B's Mission.
+4. Stop and restart B's local server. Confirm the resource/Mission/history persist. Opening another browser profile can test a separate user session.
+5. Run an isolated admin demo and review the report. It saves a `demo_runs` report; the scenario animation/report is not a substitute for the actual shared-write test above. For a real batch test, wait until a test Mission is due (the normal cutoff is 24 hours before its start), then have one admin run the batch.
+6. To test evidence end-to-end, use an eligible approved/in-use/completed test Mission and the affected organization's session. Submit a dispute with a small, non-sensitive evidence file (and the required amount for compensation). The admin must be able to preview/download it; verify the object exists in the private bucket in Supabase. A Storage badge or read-only bucket lookup alone does not prove uploads work.
+7. Withdraw test Missions and mark test resources offline through the application when finished. Test/history/evidence records persist; these actions are not a complete deletion. Use the test project's retention policy for any owner-managed cleanup, and never rerun migration to erase test records.
+
+## Optional: offline SQLite demo
+
+SQLite mode needs Python 3.10+ and no third-party packages. It does not share data between machines. Explicitly override cloud mode if `.env` exists:
+
+```bash
+# macOS/Linux
+CAMPUS_DB_BACKEND=sqlite PORT=8765 python3 server.py
+```
+
+```powershell
+# Windows PowerShell
+$env:CAMPUS_DB_BACKEND = 'sqlite'
+$env:PORT = '8765'
+py -3 server.py
+# After stopping, remove the override before cloud testing:
+Remove-Item Env:CAMPUS_DB_BACKEND
+Remove-Item Env:PORT
+```
+
+The application preserves and incrementally migrates the local SQLite data, and makes a timestamped local backup. This backup is not a backup of Supabase. Never delete a working database to reset a demo.
+
+## Shared database behavior
+
+When two or more local servers use the same `SUPABASE_DATABASE_URL`:
+
+- New resources and Missions are written to the same Postgres database.
+- The user app and administrator console read the same records.
+- The user app and admin console poll the shared database version every five seconds and refresh after a change.
+- Dispute evidence is uploaded to the private `campus-evidence` Supabase Storage bucket. The database stores its name, type, size, and cloud object path.
+- The local browser session identifies the organization being simulated. It is not production identity management.
+
+Sharing the same server Secret key gives every person who receives it backend-level access through their local copy. This is acceptable only for trusted hackathon participants. For an internet-facing deployment, keep the credentials on one hosted backend and never distribute them to end users.
+
+## User app workflow
+
+1. Open **Resources** and publish a resource with its type, capability, schedule, location, status, external replacement cost, and cost reference source.
+2. Open **Mission** and submit a short request. The platform builds feasible resource options.
+3. Before the deadline, reorder and select acceptable options. The user sees the option order but not the fairness weights.
+4. After the deadline, the administrator batch checks time and capacity conflicts, ranks competing Missions with the fairness policy, and approves a feasible option or places the Mission on the waitlist.
+5. The user sees the approved Mission/resource/space result, starts use at the scheduled time, and confirms return.
+6. If a provider does not show up or a resource is damaged, the affected organization can submit a dispute and upload evidence.
+
+## Administrator console
+
+The administrator console is an overlay inside the original website; it is not a separate public website. It is hidden from normal users and requires the administrator password.
+
+Set `CAMPUS_ADMIN_PASSWORD` in your private root `.env` before starting. Use that value to log in. Without it the server reads `.admin-password` or generates one when the file is absent and password authentication is first used. This repository has a historically tracked password file, so do not rely on it as a private default. Do not place real passwords in shell commands, screenshots or README examples.
+
+The console can:
+
+- Run due allocation batches and inspect conflicts, waitlists, bookings, and replacement states.
+- Review resources, organizations, credit scores, contribution, and freeze status.
+- Record provider no-shows and automatically reduce provider credit.
+- Review dispute descriptions and evidence files. An approved monetary compensation dispute freezes the provider until the affected organization marks it resolved.
+- Change scheduler settings and fairness policy weights. These controls are admin-only.
+- Run isolated, explainable demos without changing live resources, Missions, or bookings.
+- Review persistent history and decision snapshots.
+
+Available demo scenarios:
+
+- **Conflict and fairness** — two Missions compete for one camera after the application window closes.
+- **Withdrawal and release** — one Mission withdraws before the batch, so the conflict disappears.
+- **No-show and replacement** — the original booking is released and the requester must confirm a replacement.
+- **Option preferences** — the first option is infeasible, so the batch tries the second option in the submitted order.
+
+## Main API groups
+
+User API:
+
+- `GET /api/bootstrap`
+- `GET /api/history`
+- `POST /api/resources`
+- `PATCH /api/resources/:id`
+- `POST /api/missions`
+- `POST /api/missions/:id/preferences`
+- `POST /api/missions/:id/checkout`
+- `POST /api/missions/:id/complete`
+- `POST /api/missions/:id/withdraw`
+- `POST /api/missions/:id/disputes`
+- `POST /api/disputes/:id/resolve`
+
+Administrator API:
+
+- `POST /api/admin/login`
+- `GET /api/admin/bootstrap`
+- `POST /api/admin/allocation/run`
+- `POST /api/admin/demo/run`
+- `PATCH /api/admin/config`
+
+Administrator endpoints require the separate HttpOnly `admin_sid` cookie. User and administrator data are written to the same configured database.
+
+## Troubleshooting
+
+| Symptom | Action |
+| --- | --- |
+| `py`, `python3` or Git is missing | Install Python 3.10+ and Git; open a new terminal. On Linux install the distribution's Python venv package if venv creation fails. |
+| `psycopg` is missing | Use the same `.venv` Python for both `-m pip install -r requirements-cloud.txt` and startup. Avoid system `pip --user`. |
+| Preflight reports placeholder/missing configuration | Check `.env` is next to `server.py`, not `.env.txt`, and replace all placeholders. The owner must privately provide real values. |
+| PostgreSQL password rejected | Verify the **database password**, not the Storage key; copy the Session pooler username and URL-encode the password component. |
+| DNS failure, proxy 403 or timeout | Check project status, DNS, HTTPS 443 and pooler TCP 5432 access, VPN/firewall/IP restrictions. Use the actual Session pooler URI for IPv4. Allowing only HTTPS does not enable direct PostgreSQL. |
+| TLS certificate error | Obtain the correct CA through the provider/administrator. Configure `PGSSLROOTCERT` in your shell for preflight and `sslrootcert` in the DSN for the app. Do not disable certificate verification. |
+| Missing schema/data or permission denied | Ask the owner to prepare the test database and review role permissions. Do not rerun migrations against a populated shared project. |
+| Automatic scheduler enabled | Have the owner switch to Manual before multiple collaborators start their servers. |
+| Storage HTTP 401/403 | Check the server key belongs to the same project and is authorized; a proxy 403 can instead mean blocked network access. Do not share full error dumps or keys. |
+| Evidence bucket missing/public | Owner creates the configured private bucket or changes its visibility. Preflight does not make these changes. |
+| App says Local SQLite | Remove an old shell `CAMPUS_DB_BACKEND=sqlite` override; use the received `.env` and restart. |
+| Port already in use | Stop your previous process or change `PORT` in `.env` to 8766 and browse that port. Check for a shell override. |
+| Records differ between collaborators | Confirm the owner gave both the same test project, cloud mode is active, and each is viewing the correct organization; wait for the five-second refresh. |
+| Evidence upload fails after preflight passes | The preflight only verifies reads. Check upload permissions, configured bucket and file constraints; perform the real browser upload test. |
+
+Share only the check's PASS/FAIL lines when asking for help. Never share `.env`, the DSN, keys or credential screenshots in GitHub issues.
+
+## Repository and secret policy
+
+- `.env`, local virtual environments and private handoff folders are ignored; `.env.example` is a placeholder template only.
+- Existing tracked files are not protected by new ignore rules. The historical `.admin-password` must be overridden; previously exposed credentials must be rotated.
+- Real Supabase keys and database passwords must never be committed or placed in frontend code.
+- The tracked SQLite demo is not the shared source of truth in cloud mode. Local startup backups do not protect cloud data.
+- Migration preserves local files but can overwrite matching cloud IDs. Only the owner manages migrations after backups and comparison.
+
+## Validation status
+
+The setup scripts and safe failure paths are tested locally. Earlier cloud checks in the onboarding environment were blocked by DNS/egress restrictions; no successful live cloud connection or migration from that environment is claimed. Each collaborator must run the preflight on their own network and complete the two-person acceptance test. The owner reports their own local cloud connection works; that does not establish access from other networks.
+
+## Implementation decisions
+
+Some details were not specified in the original brief, so the MVP makes these explicit choices:
+
+- Local HttpOnly sessions and organization switching simulate multiple organizations; this is not production identity authentication.
+- A `bookings` table represents time and capacity reservations. A reserved booking does not permanently change the resource lifecycle state.
+- Taking a provider resource offline releases its active bookings and marks affected Missions as waiting for replacement confirmation.
+- The fairness total score is stored in the user-facing Mission result; the component weights remain administrator-only.
+- Real payments, maps, external identity providers, and public object storage are outside the local MVP scope.
+- The database is the single source of truth. Writes are committed to the configured backend, history entries are persistent, and both clients refresh from the same database version.
