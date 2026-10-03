@@ -19,6 +19,7 @@ The user app keeps the wording short and practical:
 - The organization profile shows contribution, credit, history, and resources owned by the current organization. Owners can edit their own resource details, availability, and status.
 - Users see the submitted time, cutoff, use interval, and the exact approved resources. Requesters can use their Mission details; resource providers see the Mission and loan period for each resource they supply. Fairness weights, batch internals, and administrator controls stay in the admin console.
 - Recent activity is filtered to the current organization.
+- The Impact and value page quantifies shared hours, estimated external cost avoided, coordination time saved, Mission coverage, and resource-pool utilization. The page shows the calculation assumptions used for each estimate.
 - A user can report a dispute and upload evidence. When an approved compensation dispute is resolved by the affected organization, the provider account is unfrozen.
 
 ## Double-click startup (recommended)
@@ -230,6 +231,10 @@ Sharing the same server Secret key gives every person who receives it backend-le
 4. After the deadline, the administrator batch checks time and capacity conflicts, ranks competing Missions with the fairness policy, and approves a feasible option or places the Mission on the waitlist.
 5. The user sees the approved Mission/resource/space result, starts use at the scheduled time, and confirms return.
 6. If a provider does not show up or a resource is damaged, the affected organization can submit a dispute and upload evidence.
+
+## Latest allocation control
+
+The admin **Run allocation batch** button explicitly sends `force: true` and processes the current open/waitlisted queue immediately, even before a Mission cutoff. Background scheduling keeps the deadline gate. Use the manual action intentionally on your shared test project; ordinary users cannot trigger it.
 
 ## v3 visual demo for recording
 

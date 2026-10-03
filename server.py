@@ -1126,7 +1126,7 @@ class Handler(BaseHTTPRequestHandler):
                     token=cookie_value(self,"admin_sid"); ADMIN_SESSIONS.discard(token or ""); self._cookies=["admin_sid=; HttpOnly; SameSite=Strict; Max-Age=0; Path=/"]; self.send_json({"ok":True}); return
                 if path == "/api/admin/allocation/run":
                     if not self.admin_ok(): self.send_json({"error":"Admin authentication required"},401); return
-                    self.send_json(admin_run_batch(db)); return
+                    self.send_json(admin_run_batch(db, force=bool(body.get("force")))); return
                 if path == "/api/admin/demo/run":
                     if not self.admin_ok(): self.send_json({"error":"Admin authentication required"},401); return
                     self.send_json(run_demo(db, body),201); return
@@ -1195,6 +1195,39 @@ def get_bootstrap(db: sqlite3.Connection, organization_id: int = 1) -> dict:
     return {"organization":dict(user),"organizations":organizations,"missions":missions,"resources":resources,"events":events,"history":get_history(db,user["id"],50),"metrics":get_metrics(db,user["id"]),"version":database_version(db)}
 
 
+def calculate_impact(db: sqlite3.Connection, organization_id: int | None = None) -> dict:
+    """Calculate transparent, aggregate value created by sharing.
+
+    Cost avoided uses each resource's external replacement/rental reference.
+    Coordination time is an estimate of 1.5 hours per booking plus 0.5 hour
+    per Mission, representing search, messages, comparison and handoff work
+    that the platform replaces.
+    """
+    params = ()
+    scope = ""
+    if organization_id is not None:
+        scope = " AND (m.requester_org_id=? OR r.owner_org_id=?)"
+        params = (organization_id, organization_id)
+    rows = db.execute(
+        "SELECT b.mission_id,b.quantity,b.start_at,b.end_at,r.external_hourly_cost,r.hourly_value,r.availability_start,r.availability_end "
+        "FROM bookings b JOIN resources r ON r.id=b.resource_id JOIN missions m ON m.id=b.mission_id "
+        "WHERE b.status IN ('active','completed')" + scope, params
+    ).fetchall()
+    shared_hours = sum(window_hours(row["start_at"], row["end_at"]) * float(row["quantity"] or 0) for row in rows)
+    cost_avoided = sum(window_hours(row["start_at"], row["end_at"]) * float(row["quantity"] or 0) * float(row["external_hourly_cost"] or row["hourly_value"] or 0) for row in rows)
+    market_value = sum(window_hours(row["start_at"], row["end_at"]) * float(row["quantity"] or 0) * float(row["hourly_value"] or 0) for row in rows)
+    mission_count = len({int(row["mission_id"]) for row in rows})
+    booking_count = len(rows)
+    coordination_hours = booking_count * 1.5 + mission_count * 0.5
+    if organization_id is None:
+        available_rows = db.execute("SELECT availability_start,availability_end FROM resources WHERE status IN ('available','maintenance','reserved')").fetchall()
+    else:
+        available_rows = db.execute("SELECT availability_start,availability_end FROM resources WHERE owner_org_id=?", (organization_id,)).fetchall()
+    available_hours = sum(window_hours(row["availability_start"], row["availability_end"]) for row in available_rows)
+    utilization = shared_hours / available_hours if available_hours else 0.0
+    return {"shared_hours": round(shared_hours, 1), "cost_avoided": round(cost_avoided, 2), "market_value": round(market_value, 2), "coordination_hours_saved": round(coordination_hours, 1), "missions_supported": mission_count, "bookings": booking_count, "utilization": round(min(1.0, utilization), 2), "calculation_note": "Cost avoided uses the provider's external replacement/rental reference. Time saved is estimated at 1.5 coordination hours per booking plus 0.5 hour per Mission."}
+
+
 def get_metrics(db: sqlite3.Connection, organization_id: int | None = None) -> dict:
     own = (" AND owner_org_id=?", (organization_id,)) if organization_id else ("", ())
     resource_count = db.execute(f"SELECT COUNT(*) FROM resources WHERE status='available'{own[0]}", own[1]).fetchone()[0]
@@ -1221,7 +1254,9 @@ def get_metrics(db: sqlite3.Connection, organization_id: int | None = None) -> d
     providers={row["owner_org_id"] for row in completed}
     concentration=(len(providers)/len(completed)) if completed else 0.0
     decision_scores=[float(row["fairness_score"]) for row in decisions if row["fairness_score"] is not None]
-    return {"resource_count":resource_count,"active_hours":round(active_hours,1),"missions":len(missions),"allocation_success_rate":round(successful/max(1,len(missions)),2),"first_choice_satisfaction":round(len(first_choice)/max(1,len([row for row in decisions if row["outcome"] == "allocated"])),2),"resource_concentration":round(concentration,2),"estimated_cost_saved":round(estimated_cost_saved,2),"fairness_index":round(sum(decision_scores)/max(1,len(decision_scores)),2) if decision_scores else round(sum(scores)/max(1,len(scores)),2)}
+    impact = calculate_impact(db, organization_id)
+    platform_impact = calculate_impact(db)
+    return {"resource_count":resource_count,"active_hours":round(active_hours,1),"missions":len(missions),"allocation_success_rate":round(successful/max(1,len(missions)),2),"first_choice_satisfaction":round(len(first_choice)/max(1,len([row for row in decisions if row["outcome"] == "allocated"])),2),"resource_concentration":round(concentration,2),"estimated_cost_saved":round(estimated_cost_saved,2),"fairness_index":round(sum(decision_scores)/max(1,len(decision_scores)),2) if decision_scores else round(sum(scores)/max(1,len(scores)),2),"impact":impact,"platform_impact":platform_impact}
 
 
 def create_resource(db: sqlite3.Connection, body: dict, owner_org_id: int) -> dict:
@@ -1344,14 +1379,19 @@ def mission_provider_ids(db: sqlite3.Connection, mission: sqlite3.Row) -> list[i
 def normalized_evidence(body: dict) -> list[dict]:
     evidence = body.get("evidence") or []
     if not isinstance(evidence, list): raise ValueError("Evidence must be a list")
+    if len(evidence) > 5: raise ValueError("Upload at most 5 evidence files")
     normalized = []
-    for item in evidence[:5]:
-        if not isinstance(item, dict) or not item.get("name"): continue
+    for item in evidence:
+        if not isinstance(item, dict) or not item.get("name"): raise ValueError("Evidence filename is missing")
         data = str(item.get("data") or "")
-        # Evidence is kept in the local SQLite store for the demo. Keep each
-        # encoded attachment bounded so one dispute cannot exhaust the DB.
-        if len(data) > 2_500_000: raise ValueError("Each evidence file must be smaller than 2 MB")
-        normalized.append({"name": str(item["name"])[:160], "type": str(item.get("type") or "application/octet-stream")[:120], "size": int(item.get("size") or 0), "data": data})
+        try:
+            header, encoded = data.split(",", 1)
+            if not header.startswith("data:") or ";base64" not in header: raise ValueError()
+            raw = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error): raise ValueError("Evidence file content is invalid. Select the file again.")
+        if not raw: raise ValueError("Evidence file is empty")
+        if len(raw) > 10 * 1024 * 1024: raise ValueError("Each evidence file must be at most 10 MB")
+        normalized.append({"name": str(item["name"])[:160], "type": str(item.get("type") or header[5:].split(";")[0] or "application/octet-stream")[:120], "size": len(raw), "data": data})
     return normalized
 
 
@@ -1376,11 +1416,15 @@ def persist_evidence_to_supabase(evidence: list[dict], mission_id: int) -> list[
     if not cloud_evidence_enabled(): return evidence
     bucket = urllib.parse.quote(SUPABASE_EVIDENCE_BUCKET, safe="")
     try:
-        request = urllib.request.Request(f"{SUPABASE_URL}/storage/v1/bucket", data=json.dumps({"id": SUPABASE_EVIDENCE_BUCKET, "name": SUPABASE_EVIDENCE_BUCKET, "public": False}).encode(), headers=supabase_headers("application/json"), method="POST")
+        # Read an existing bucket first: Supabase may report duplicate bucket
+        # creation as HTTP 400 rather than 409.
+        request = urllib.request.Request(f"{SUPABASE_URL}/storage/v1/bucket/{bucket}", headers=supabase_headers(), method="GET")
         try:
             with urllib.request.urlopen(request, timeout=12): pass
         except urllib.error.HTTPError as exc:
-            if exc.code != 409: raise
+            if exc.code != 404: raise
+            request = urllib.request.Request(f"{SUPABASE_URL}/storage/v1/bucket", data=json.dumps({"id": SUPABASE_EVIDENCE_BUCKET, "name": SUPABASE_EVIDENCE_BUCKET, "public": False}).encode(), headers=supabase_headers("application/json"), method="POST")
+            with urllib.request.urlopen(request, timeout=12): pass
         uploaded = []
         for item in evidence:
             data_url = item.get("data", "")
@@ -1433,9 +1477,15 @@ def create_dispute(db: sqlite3.Connection, mission_id: int, body: dict, reporter
     return {"dispute": row_to_dispute(dispute, db)}
 
 
-def admin_run_batch(db):
+def admin_run_batch(db, force: bool = False):
     now=datetime.now(UTC); cfg=db.execute("SELECT weights FROM admin_config WHERE id=1").fetchone(); weights=loads(cfg["weights"],{}) if cfg else {}
-    rows=db.execute("SELECT * FROM missions WHERE status IN ('open','waitlisted') AND deadline<=? ORDER BY deadline,id",(now.isoformat(),)).fetchall()
+    if force:
+        # Manual admin runs are explicit test/operations actions and process
+        # the current queue immediately. The background scheduler keeps the
+        # deadline gate by calling this function with force=False.
+        rows=db.execute("SELECT * FROM missions WHERE status IN ('open','waitlisted') ORDER BY deadline,id").fetchall()
+    else:
+        rows=db.execute("SELECT * FROM missions WHERE status IN ('open','waitlisted') AND deadline<=? ORDER BY deadline,id",(now.isoformat(),)).fetchall()
     ranked=[]
     for row in rows:
         org=db.execute("SELECT * FROM organizations WHERE id=?",(row["requester_org_id"],)).fetchone(); fairness=org_fairness(org,row,len(loads(row["plans"],[])),weights) if org else {"score":0}
@@ -1464,7 +1514,7 @@ def admin_run_batch(db):
         for provider_id in sorted({int(item["owner_org_id"]) for item in chosen.get("items",[]) if item.get("owner_org_id")}):
             add_event(db,"allocation","Resource lent out",f"{row['title']} was approved and uses resources from your organization.",provider_id)
         add_history(db,"mission",row["id"],row["requester_org_id"],"status_allocated",updated); record_decision(db,row,fairness,chosen,"allocated",weights,f"Selected {chosen['id']} as the first feasible plan in the submitted preference order."); allocated.append({"mission_id":row["id"],"title":row["title"],"plan_id":chosen["id"],"fairness":{"score":round(score,3)}})
-    db.commit(); return {"allocated":allocated,"waitlisted":waitlisted,"processed_at":now_iso(),"message":f"Due batch: {len(allocated)} approved, {len(waitlisted)} waitlisted"}
+    db.commit(); return {"allocated":allocated,"waitlisted":waitlisted,"processed_at":now_iso(),"forced":force,"message":f"Batch: {len(allocated)} approved, {len(waitlisted)} waitlisted"}
 
 
 def update_resource(db, resource_id, body, owner_id=None, admin=False):
