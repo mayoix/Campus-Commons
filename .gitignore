@@ -1,0 +1,5 @@
+campus_commons.sqlite3
+campus_commons.sqlite3.bak-*
+.admin-password
+__pycache__/
+.DS_Store
