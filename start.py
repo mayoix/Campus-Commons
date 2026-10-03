@@ -9,12 +9,46 @@ import secrets
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 import venv
 import webbrowser
 
 ROOT = Path(__file__).resolve().parent
+
+
+def startup_hint(output):
+    """Return only fixed messages, never raw credential-bearing exceptions."""
+    text = output.lower()
+    for needles, message in (
+        (('password authentication failed', 'invalidpassword'), 'Database password rejected. Check SUPABASE_DATABASE_URL and password URL encoding.'),
+        (('failed to resolve', 'could not translate host', 'name resolution'), 'Database hostname could not be resolved. Check the Session pooler hostname and DNS.'),
+        (('certificate verify failed', 'root certificate', 'ssl error'), 'TLS verification failed. Check the provider CA and sslrootcert setting.'),
+        (('permission denied', 'insufficientprivilege'), 'Database permission denied. The app needs schema and read/write privileges.'),
+        (('undefinedcolumn', 'undefinedtable', 'does not exist'), 'Cloud database schema is missing or outdated. Ask the owner to check the v2 schema; do not rerun migration blindly.'),
+        (('connection timed out', 'network is unreachable', 'connection refused'), 'Database network connection failed. Check Session pooler TCP access and project status.'),
+        (('server closed the connection', 'connection reset'), 'The database connection was closed. Check the exact Session pooler URI, project status and network access.'),
+        (('querycanceled', 'locknotavailable', 'lock timeout'), 'A database query is blocked or timed out. Check other running servers and database locks.'),
+    ):
+        if any(needle in text for needle in needles):
+            return message
+    return None
+
+
+def collect_startup_hints(stream, hints):
+    pending = ''
+    try:
+        while True:
+            chunk = stream.read1(4096)
+            if not chunk:
+                break
+            pending = (pending + chunk.decode('utf-8', errors='replace'))[-8192:]
+            hint = startup_hint(pending)
+            if hint:
+                hints['message'] = hint
+    except (OSError, ValueError):
+        pass
 
 
 def configuration():
@@ -106,29 +140,46 @@ def launch(python, values, port):
     values = dict(values, CAMPUS_DB_BACKEND='supabase', PORT=str(port))
     child = subprocess.Popen(
         [str(python), '-u', str(ROOT / 'server.py')], cwd=ROOT, env=values,
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )
-    # Discard potentially sensitive bytes directly without decoding Windows
-    # GBK/UTF-8 output or retaining credential-bearing exception text.
+    hints = {}
+    reader = threading.Thread(target=collect_startup_hints, args=(child.stdout, hints), daemon=True)
+    reader.start()
     url = f'http://127.0.0.1:{port}/'
     # Local readiness must not go through a user's HTTP proxy.
     client = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
         print('Connecting to the shared database...', flush=True)
-        deadline = time.monotonic() + 90
+        deadline = time.monotonic() + 120
         while time.monotonic() < deadline:
             if child.poll() is not None:
-                raise RuntimeError('The server could not start. Ask the owner to check cloud credentials, database permissions and network access. See README troubleshooting.')
+                reader.join(timeout=1)
+                raise RuntimeError('The server could not start. ' + hints.get('message', 'Check cloud credentials, database permissions and network access. See README troubleshooting.'))
+            page_ready = False
             try:
-                with client.open(url + 'api/bootstrap', timeout=2) as response:
+                # A lightweight static page confirms init_db has completed.
+                # Do not launch repeated two-second database queries while
+                # previous cloud requests are still running behind DB_LOCK.
+                with client.open(url, timeout=2) as response:
+                    if response.status != 200:
+                        raise ValueError('Page unavailable')
+                page_ready = True
+                print('Server started. Loading shared data (may take up to 60 seconds)...', flush=True)
+                with client.open(url + 'api/bootstrap', timeout=60) as response:
                     data = json.load(response)
                 if data.get('organizations') and 'version' in data:
                     break
+                raise RuntimeError('The database response contains no organizations. Ask the owner to check shared data.')
             except (OSError, ValueError):
-                pass
+                if hints.get('message'):
+                    raise RuntimeError(hints['message']) from None
+                # If the page is serving but bootstrap fails, avoid a request
+                # storm against the database. Surface this phase separately.
+                if page_ready:
+                    raise RuntimeError('The server started, but loading cloud data failed. ' + hints.get('message', 'Check database connectivity and the v2 schema.')) from None
             time.sleep(.4)
         else:
-            raise RuntimeError('Cloud startup timed out. Check network access and the Supabase project status.')
+            raise RuntimeError('Cloud initialization timed out. ' + hints.get('message', 'Check database network access and locks; stop other local servers and retry.'))
         print(f'Campus Commons is ready: {url}', flush=True)
         print('Keep this window open. Press Ctrl+C to stop.', flush=True)
         try:
@@ -149,6 +200,8 @@ def launch(python, values, port):
             except subprocess.TimeoutExpired:
                 child.kill()
                 child.wait()
+        reader.join(timeout=1)
+        child.stdout.close()
 
 
 def main():

@@ -31,7 +31,7 @@ For trusted collaborators, there is no need to install packages manually or run 
 2. Download **Code → Download ZIP** from the latest `main` branch and extract the entire folder. Receive the owner's private test-project `.env` and place it next to `server.py` and `start.py`. Keep its filename exactly `.env`, not `.env.txt`.
 3. Double-click **`Start Campus Commons.bat`** on Windows or **`Start Campus Commons.command`** on macOS. On Linux, run the executable `.command` file from a terminal or run `python3 start.py` in the project folder.
 
-The launcher creates `.venv`, installs the pinned cloud driver on first use, starts the application in Supabase mode, and opens the browser once the application responds. Dependencies are reused on later launches. Keep its terminal window open; press **Ctrl + C** to stop the server. Later visits only require double-clicking the launcher. First-time dependency installation and every cloud connection need internet access.
+The launcher creates `.venv`, installs the pinned cloud driver on first use, starts the application in Supabase mode, and opens the browser after the page and shared data respond. It waits for initialization before making one cloud-data request with a 60-second timeout, rather than repeatedly interrupting database requests after two seconds. Dependencies are reused on later launches. Keep its terminal window open; press **Ctrl + C** to stop the server. Later visits only require double-clicking the launcher. First-time dependency installation and every cloud connection need internet access.
 
 If macOS blocks opening the downloaded command, use Finder's **Open** option for the file you trust. If executable permission was lost while extracting, run `chmod +x "Start Campus Commons.command"` once, or use `python3 start.py` from a terminal. Windows users should extract the folder before double-clicking, not run from inside the ZIP viewer. Startup does not require administrator rights.
 
@@ -288,6 +288,7 @@ Administrator endpoints require the separate HttpOnly `admin_sid` cookie. User a
 | `psycopg` is missing | Use the same `.venv` Python for both `-m pip install -r requirements-cloud.txt` and startup. Avoid system `pip --user`. |
 | Preflight reports placeholder/missing configuration | Check `.env` is next to `server.py`, not `.env.txt`, and replace all placeholders. The owner must privately provide real values. |
 | PostgreSQL password rejected | Verify the **database password**, not the Storage key; copy the Session pooler username and URL-encode the password component. |
+| `Cloud initialization timed out` | Initialization did not finish within two minutes. Stop other local servers and check database connectivity/locks. If `Server started. Loading shared data` appeared, the server is listening but its data request is failing; share only the new fixed diagnostic message. |
 | DNS failure, proxy 403 or timeout | Check project status, DNS, HTTPS 443 and pooler TCP 5432 access, VPN/firewall/IP restrictions. Use the actual Session pooler URI for IPv4. Allowing only HTTPS does not enable direct PostgreSQL. |
 | TLS certificate error | Obtain the correct CA through the provider/administrator. Configure `PGSSLROOTCERT` in your shell for preflight and `sslrootcert` in the DSN for the app. Do not disable certificate verification. |
 | Missing schema/data or permission denied | Ask the owner to prepare the test database and review role permissions. Do not rerun migrations against a populated shared project. |
@@ -311,7 +312,7 @@ Share only the check's PASS/FAIL lines when asking for help. Never share `.env`,
 
 ## Validation status
 
-The launcher and read-only diagnostic have 14 passing automated tests. Launcher readiness, browser-opening timing, child-process cleanup and safe failure paths were tested on Linux, along with real first-time dependency installation and reuse. Windows/macOS launch wrappers have not been run on their native operating systems. Earlier cloud checks in the onboarding environment were blocked by DNS/egress restrictions; no successful live cloud connection or migration from that environment is claimed. Each collaborator must run the preflight on their own network and complete the two-person acceptance test. The owner reports their own local cloud connection works; that does not establish access from other networks.
+The launcher and read-only diagnostic have 16 passing automated tests. Launcher readiness, browser-opening timing, child-process cleanup and safe failure paths were tested on Linux, along with real first-time dependency installation and reuse. Windows/macOS launch wrappers have not been run on their native operating systems. Earlier cloud checks in the onboarding environment were blocked by DNS/egress restrictions; no successful live cloud connection or migration from that environment is claimed. Each collaborator must run the preflight on their own network and complete the two-person acceptance test. The owner reports their own local cloud connection works; that does not establish access from other networks.
 
 ## Implementation decisions
 

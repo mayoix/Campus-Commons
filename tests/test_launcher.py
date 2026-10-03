@@ -6,6 +6,7 @@ from pathlib import Path
 import socket
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -90,6 +91,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 server = HTTPServer(("127.0.0.1", int(os.environ["PORT"])), Handler)
 server.handle_request()
+server.handle_request()
 server.server_close()
 ''')
             with socket.socket() as probe:
@@ -108,6 +110,36 @@ server.server_close()
                 launcher.launch(Path(sys.executable), self.values(), port)
             browser.assert_not_called()
             self.assertNotIn('test-only-secret-in-raw-error', output.getvalue())
+
+    def test_database_error_classification_does_not_include_secrets(self):
+        error = 'psycopg.OperationalError: password authentication failed for user secret-user postgresql://secret:secret-password@host/db'
+        hint = launcher.startup_hint(error)
+        self.assertIn('Database password rejected', hint)
+        self.assertNotIn('secret', hint)
+
+    def test_slow_bootstrap_is_not_retried_every_two_seconds(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(launcher, 'ROOT', Path(directory)), patch.object(launcher.webbrowser, 'open', return_value=True), contextlib.redirect_stdout(io.StringIO()):
+            (Path(directory) / 'server.py').write_text('''import os, time
+from http.server import HTTPServer, BaseHTTPRequestHandler
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/api/bootstrap':
+            time.sleep(3)
+            body = b'{"organizations":[{"id":1}],"version":"slow"}'
+        else:
+            body = b'<html>Campus Commons</html>'
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(body)
+server = HTTPServer(('127.0.0.1', int(os.environ['PORT'])), Handler)
+server.handle_request()
+server.handle_request()
+server.server_close()
+''')
+            with socket.socket() as probe:
+                probe.bind(('127.0.0.1', 0))
+                port = probe.getsockname()[1]
+            self.assertEqual(launcher.launch(Path(sys.executable), self.values(), port), 0)
 
 
 if __name__ == '__main__':
