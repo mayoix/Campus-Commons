@@ -21,11 +21,29 @@ The user app keeps the wording short and practical:
 - Recent activity is filtered to the current organization.
 - A user can report a dispute and upload evidence. When an approved compensation dispute is resolved by the affected organization, the provider account is unfrozen.
 
-## Quick start for trusted collaborators
+## Double-click startup (recommended)
+
+For trusted collaborators, there is no need to install packages manually or run a separate connection check.
+
+**First use:**
+
+1. Install **Python 3.10 or newer** from [python.org](https://www.python.org/downloads/) if it is not already installed. On Windows include the Python launcher (`py`) during installation. Linux may also need its distribution's Python venv package.
+2. Download **Code → Download ZIP** from the latest `main` branch and extract the entire folder. Receive the owner's private test-project `.env` and place it next to `server.py` and `start.py`. Keep its filename exactly `.env`, not `.env.txt`.
+3. Double-click **`Start Campus Commons.bat`** on Windows or **`Start Campus Commons.command`** on macOS. On Linux, run the executable `.command` file from a terminal or run `python3 start.py` in the project folder.
+
+The launcher creates `.venv`, installs the pinned cloud driver on first use, starts the application in Supabase mode, and opens the browser once the application responds. Dependencies are reused on later launches. Keep its terminal window open; press **Ctrl + C** to stop the server. Later visits only require double-clicking the launcher. First-time dependency installation and every cloud connection need internet access.
+
+If macOS blocks opening the downloaded command, use Finder's **Open** option for the file you trust. If executable permission was lost while extracting, run `chmod +x "Start Campus Commons.command"` once, or use `python3 start.py` from a terminal. Windows users should extract the folder before double-clicking, not run from inside the ZIP viewer. Startup does not require administrator rights.
+
+A missing/incomplete `.env`, occupied port or failed cloud startup produces a short message and leaves the error window open. The launcher never copies credentials into code, migrates the SQLite data to Supabase, or silently switches to SQLite. Normal application startup can still initialize/backfill schema/history. It does not test evidence uploads; those happen when used in the app. Connection checks below are optional troubleshooting tools, not a daily startup requirement.
+
+**Owner's simplest handoff:** privately send the trusted collaborator a folder/package containing this source version plus the completed test `.env`, using the encrypted delivery method below. Exclude `.git`, `.venv`, local backups and your historical `.admin-password`; do not omit the tracked demo SQLite file if you want the optional offline demo. Never publish a configured package on GitHub. Alternatively, let collaborators download GitHub's ZIP and privately send just `.env` once. Keep automatic scheduling Manual and prepare the shared database once before distributing the package.
+
+## Manual setup and optional diagnostics
 
 A clone alone cannot connect to the shared database: the owner must supply a valid private `.env`, prepare the cloud schema/data and allow your network to reach Supabase. Use a **separate Supabase test project**. Everyone using it can change the same test data. Ordinary end users should use a hosted backend instead of receiving these credentials.
 
-These instructions are on `main` **after** the `v2.0.0` tag. Clone `main`; that older tag does not contain the preflight script or dependency file below. Python 3.10+ and Git are required. Downloading **Code → Download ZIP** and extracting it is also supported; run commands in the folder containing `server.py`.
+These instructions are on `main` **after** the `v2.0.0` tag. Clone `main`; that older tag does not contain the preflight script or dependency file below. Python 3.10+ is required; Git is needed only for `git clone`. Downloading **Code → Download ZIP** and extracting it is also supported; run commands in the folder containing `server.py`.
 
 ### 1. Download and install
 
@@ -83,7 +101,7 @@ The Storage URL, server key and database URI must all belong to the same test pr
 
 Shell environment variables override `.env`. If an old configuration persists, use a fresh terminal or unset the old `SUPABASE_*`/`CAMPUS_DB_BACKEND` values and restart. `CAMPUS_DB_PATH` is read before `.env` in this version; if you need that optional SQLite override, set it in the shell rather than in `.env`.
 
-### 3. Check the connection before starting
+### 3. Optional connection diagnostics
 
 macOS/Linux:
 
@@ -99,7 +117,7 @@ Windows PowerShell:
 
 The check loads the root `.env`, verifies PostgreSQL authentication and TLS, reads all 13 application tables, checks that organizations/admin configuration exist, checks that automatic scheduling is off, and authenticates to Storage to find the private evidence bucket. It also checks that a private admin-password override is configured. It prints no keys, passwords or raw server errors. A failure returns a nonzero exit code; it never migrates, writes rows, creates buckets or starts the scheduler.
 
-Expected final message: `Read-only preflight passed.` This establishes connectivity and reads, **not** database writes, evidence upload permissions or UI behavior. Complete the two-person test below as well. Do not start the server until failures are resolved with the owner.
+Expected final message: `Read-only preflight passed.` This establishes connectivity and reads, **not** database writes, evidence upload permissions or UI behavior. Complete the two-person test below as well. If you run these diagnostics, resolve failures with the owner; double-click startup does not require this separate step.
 
 ### 4. Start and open the platform
 
@@ -146,7 +164,7 @@ Open the admin overlay with **Option + Shift + A** on macOS or **Alt + Shift + A
 
    `-p` prompts interactively; do not append the passphrase to the command or store it in shell history. Run `7z t campus-commons-test-env.7z` and enter the passphrase to verify the archive. Basic OS ZIP tools may not support encrypted 7z extraction; recipients need a compatible tool.
 4. Send the archive through a private recipient-restricted transfer with an expiry. Deliver the passphrase over a separate authenticated channel, such as a phone call or password manager. Verify the recipient identity; do not post both in a shared public channel.
-5. The recipient decrypts it locally, places `.env` next to `server.py`, runs the preflight, and keeps the file private. On macOS/Linux run `chmod 600 .env`. On Windows use an access-controlled user folder and check the file's Security permissions. Remove unnecessary temporary plaintext copies after confirming setup; keep only a protected backup if needed.
+5. The recipient decrypts it locally, places `.env` next to `server.py`, double-clicks the platform launcher, and keeps the file private. On macOS/Linux run `chmod 600 .env`. On Windows use an access-controlled user folder and check the file's Security permissions. Remove unnecessary temporary plaintext copies after confirming setup; keep only a protected backup if needed.
 
 Before committing any project changes, run:
 
@@ -161,7 +179,7 @@ The first must report `.env`; the second must **fail** because the file must not
 
 Use only the shared test project and dummy evidence. Agree on a unique prefix such as `TEST-A-20261003` so test records are identifiable.
 
-1. Both collaborators run the preflight, start their servers, and confirm the Supabase backend. Use a healthy demo organization; keep the scheduler manual.
+1. Both collaborators double-click their launchers and confirm the Supabase backend. Use the optional preflight only if needed for troubleshooting. Use a healthy demo organization; keep the scheduler manual.
 2. Person A publishes an available resource with the prefix and a future availability window. Person B waits at least five seconds (or refreshes) and confirms that the same named resource appears on their computer. A changes its description/location, and B confirms the updated value. This proves shared reads and writes rather than two isolated SQLite demos.
 3. B switches to a different demo organization and submits a Mission for that resource's available time. The designated administrator confirms it appears in their Mission list/history. User Mission lists are scoped to their current organization, so A's ordinary user view need not show B's Mission.
 4. Stop and restart B's local server. Confirm the resource/Mission/history persist. Opening another browser profile can test a separate user session.
@@ -291,7 +309,7 @@ Share only the check's PASS/FAIL lines when asking for help. Never share `.env`,
 
 ## Validation status
 
-The setup scripts and safe failure paths are tested locally. Earlier cloud checks in the onboarding environment were blocked by DNS/egress restrictions; no successful live cloud connection or migration from that environment is claimed. Each collaborator must run the preflight on their own network and complete the two-person acceptance test. The owner reports their own local cloud connection works; that does not establish access from other networks.
+The launcher and read-only diagnostic have 12 passing automated tests. Launcher readiness, browser-opening timing, child-process cleanup and safe failure paths were tested on Linux, along with real first-time dependency installation and reuse. Windows/macOS launch wrappers have not been run on their native operating systems. Earlier cloud checks in the onboarding environment were blocked by DNS/egress restrictions; no successful live cloud connection or migration from that environment is claimed. Each collaborator must run the preflight on their own network and complete the two-person acceptance test. The owner reports their own local cloud connection works; that does not establish access from other networks.
 
 ## Implementation decisions
 
