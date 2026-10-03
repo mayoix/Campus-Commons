@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <meta name="robots" content="noindex,nofollow" />
   <title>Campus Commons · admin console</title>
-  <link rel="stylesheet" href="/static/admin.css" />
+  <link rel="stylesheet" href="/static/admin.css?v=v3-demo1" />
 </head>
 <body>
   <div class="admin-shell">
@@ -19,7 +19,7 @@
         <h1>Admin console sign in</h1>
         <p>Use this console to run allocation batches, test fairness, manage resources and organizations, and run demos. These controls are hidden from regular users.</p>
         <form id="login-form"><label for="admin-password">Admin password</label><input id="admin-password" type="password" autocomplete="current-password" required placeholder="Enter the admin password" /><button class="primary" type="submit">Open admin console</button></form>
-        <small class="login-hint">The local demo password is stored in the project root <code>.admin-password</code>; set <code>CAMPUS_ADMIN_PASSWORD</code> when deploying; environment variables take precedence.</small>
+        <small class="login-hint">Use <code>CAMPUS_ADMIN_PASSWORD</code> from your private configuration. If omitted with double-click startup, view the generated password privately in <code>.launcher-admin-password</code>.</small>
         <div id="file-warning" class="notice" hidden>This is a local file preview and cannot reach the platform server. Return to <a href="http://127.0.0.1:8765/">the main site</a>, then press Option (⌥) + Shift + A to open the admin overlay.</div>
         <div id="login-error" class="error" role="alert"></div>
       </section>
@@ -48,7 +48,7 @@
       </section>
     </main>
   </div>
-  <script src="/static/admin.js?v=20261003en1"></script>
+  <script src="/static/admin.js?v=v3-demo1"></script>
   <script>if(location.protocol === 'file:'){document.getElementById('file-warning').hidden=false;document.getElementById('login-form').hidden=true;}</script>
 </body>
 </html>

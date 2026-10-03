@@ -17,7 +17,7 @@
   }
   async function load() { state.data = await api("/api/admin/bootstrap"); $("admin-login").hidden = true; $("admin-app").hidden = false; $("admin-logout").hidden = false; $("admin-session-label").textContent = `Admin · ${fmtDate(new Date().toISOString())}`; render(); startSync(); }
   async function sync() {
-    if (!state.data || syncBusy) return;
+    if (!state.data || syncBusy || player.playing || $("demo-stage")?.classList.contains("demo-presentation")) return;
     syncBusy = true;
     try {
       const next = await api("/api/admin/bootstrap");
@@ -27,7 +27,7 @@
     } finally { syncBusy = false; }
   }
   function startSync() { if (!syncTimer) syncTimer = window.setInterval(sync, 5000); }
-  window.stopAdminSync = () => { if (syncTimer) window.clearInterval(syncTimer); syncTimer = null; };
+  window.stopAdminSync = () => { stopDemo(); if (syncTimer) window.clearInterval(syncTimer); syncTimer = null; };
   function table(headers, rows) { return `<div class="table-wrap"><table class="admin-table"><thead><tr>${headers.map((h) => `<th>${h}</th>`).join("")}</tr></thead><tbody>${rows || `<tr><td colspan="${headers.length}" class="muted">No data</td></tr>`}</tbody></table></div>`; }
   function statusPill(status) { const cls = ["withdrawn","offline","maintenance","rejected"].includes(status) ? " red" : ["waitlisted","reserved","in_use","awaiting_victim"].includes(status) ? " orange" : ""; return `<span class="pill${cls}">${esc(fmtStatus(status))}</span>`; }
   function render() { if (!state.data) return; renderDashboard(); renderMissions(); renderResources(); renderOrganizations(); renderDemo(); renderDisputes(); renderHistory(); showTab(state.tab); }
@@ -55,15 +55,79 @@
   }
   function renderDemo() {
     const config = state.data.config || {}, weights = config.weights || {};
-    const latest = state.data.demo_runs?.[0] ? parseDemoReport(state.data.demo_runs[0].report) : null;
-    const scenarioButtons = [["all","Run all scenarios"],["conflict","Conflict and fairness"],["withdrawal","Withdrawal and release"],["replacement","No-show and replacement"],["preference","Option preferences"]];
-    $("tab-demo").innerHTML = `<h1>Demo tests</h1><p>An explainable process demo for developers and judges. Each run is isolated and does not change live resources, Missions, or bookings.</p><div class="demo-scenario-toolbar">${scenarioButtons.map(([key,label]) => `<button class="${key === 'all' ? 'primary' : ''}" data-action="run-demo" data-scenario="${key}">${label}</button>`).join("")}</div><div class="grid-two"><div class="panel"><h2>How to read this demo</h2><ol><li><b>Timeline</b> shows the order of submission, deadline, batch, conflict, and result.</li><li><b>Fairness calculation</b> shows each candidate organization's inputs, total score, and winner or waitlist reason.</li><li><b>Exception handling</b> shows withdrawal, no-show, credit events, and replacement confirmation.</li></ol><div class="notice">The user app only receives the final approved, waitlisted, or replacement-pending status. The decision evidence is shown here.</div></div><div class="panel"><h2>Scheduler settings</h2><div class="form-grid"><label>Scheduler<select id="scheduler-enabled"><option value="0" ${!config.scheduler_enabled ? "selected" : ""}>Manual</option><option value="1" ${config.scheduler_enabled ? "selected" : ""}>Automatic</option></select></label><label>Interval (seconds)<input id="scheduler-interval" type="number" min="30" value="${esc(config.interval_seconds || 300)}" /></label></div><h3>Fairness policy (admin only)</h3><div class="weight-grid">${Object.entries(weights).map(([key,val])=>`<label>${esc(key)}<input data-weight="${esc(key)}" type="number" min="0" max="1" step=".01" value="${esc(val)}" /></label>`).join("")}</div><button data-action="save-config" class="primary" style="margin-top:12px">Save settings</button></div></div><div class="panel demo-latest" style="margin-top:16px"><div class="panel-headline"><div><h2>Explainable demo report</h2><small>${latest ? `Run ${esc(latest.demo_run_id || state.data.demo_runs[0].id)} · ${esc(latest.scenario_title || 'Completed')}` : 'Not run yet'}</small></div>${latest ? `<span class="pill">${esc(latest.assertions_passed || 0)} / ${esc(latest.assertions_total || 0)} assertions passed</span>` : ''}</div><div id="demo-report">${latest ? renderDemoReport(latest) : '<div class="demo-empty">Choose a scenario above to start</div>'}</div></div>`;
+    const saved = state.data.demo_runs?.[0];
+    const latest = saved ? {...parseDemoReport(saved.report), demo_run_id:saved.id} : null;
+    const buttons = [["all","Run all scenarios"],["conflict","Conflict and fairness"],["withdrawal","Withdrawal and release"],["replacement","No-show and replacement"],["preference","Option preferences"]];
+    $("tab-demo").innerHTML = `<h1>Demo studio</h1><p>Watch requests turn into decisions. These isolated teaching scenarios explain the policy without changing live bookings.</p><div class="demo-scenario-toolbar">${buttons.map(([key,label]) => `<button data-action="run-demo" data-scenario="${key}">${label}</button>`).join('')}</div><div id="demo-stage" class="demo-player"></div><details class="panel demo-written"><summary>Written report and scenario checkpoints</summary><div id="demo-report">${latest ? renderDemoReport(latest) : 'Run a scenario to create a report.'}</div></details><details class="panel demo-written"><summary>Scheduler and policy settings</summary><div class="form-grid"><label>Scheduler<select id="scheduler-enabled"><option value="0" ${!config.scheduler_enabled ? 'selected' : ''}>Manual</option><option value="1" ${config.scheduler_enabled ? 'selected' : ''}>Automatic</option></select></label><label>Interval (seconds)<input id="scheduler-interval" type="number" min="30" value="${esc(config.interval_seconds || 300)}" /></label></div><div class="weight-grid">${Object.entries(weights).map(([key,val]) => `<label>${esc(key)}<input data-weight="${esc(key)}" type="number" min="0" max="1" step=".01" value="${esc(val)}" /></label>`).join('')}</div><button data-action="save-config" class="primary">Save settings</button></details>`;
+    setDemoReport(latest);
     bindActions();
   }
   function parseDemoReport(raw) {
     if (!raw) return null;
     if (typeof raw === "object") return raw;
     try { return JSON.parse(raw); } catch (_) { return { legacy: String(raw) }; }
+  }
+  const player = { report: null, scenario: 0, step: 0, playing: false, delay: 5000 };
+  let demoTimer = null;
+  function stopDemo() { if (demoTimer) clearInterval(demoTimer); demoTimer = null; player.playing = false; }
+  function setDemoReport(report) {
+    if (report && report.demo_run_id !== player.report?.demo_run_id) {
+      stopDemo(); player.report = report; player.scenario = 0; player.step = 0;
+    }
+    paintDemo();
+  }
+  function moveDemo(delta) {
+    const scenarios = player.report?.scenarios || [];
+    const count = scenarios[player.scenario]?.timeline?.length || 0;
+    if (delta > 0 && player.step >= count - 1) {
+      if (player.scenario < scenarios.length - 1) { player.scenario++; player.step = 0; }
+      else stopDemo();
+    } else if (delta < 0 && player.step === 0 && player.scenario > 0) {
+      player.scenario--; player.step = scenarios[player.scenario].timeline.length - 1;
+    } else player.step = Math.max(0, Math.min(count - 1, player.step + delta));
+    paintDemo();
+  }
+  function playDemo() {
+    stopDemo(); player.playing = true;
+    demoTimer = setInterval(() => moveDemo(1), player.delay);
+    paintDemo();
+  }
+  function paintDemo() {
+    const root = $("demo-stage");
+    if (!root) return;
+    const report = player.report, scenarios = report?.scenarios || [], scenario = scenarios[player.scenario];
+    if (!scenario?.frames?.length) {
+      root.innerHTML = '<div class="demo-empty"><h2>See the allocation happen</h2><p>Run a scenario above to create a visual replay. Older reports remain available in the written report.</p></div>';
+      return;
+    }
+    const step = scenario.timeline[player.step], frame = scenario.frames[player.step];
+    const final = player.scenario === scenarios.length - 1 && player.step === scenario.timeline.length - 1;
+    const labels = {urgency:"Urgency", contribution:"Contribution", credit:"Credit", access_fairness:"Access fairness", alternative_scarcity:"Scarcity"};
+    const tone = value => /withdrawn|released|unavailable/i.test(value) ? 'released' : /wait|conflict|pending|proposed|occupied|infeasible|ranking/i.test(value) ? 'waiting' : /allocated|booked|available/i.test(value) ? 'good' : 'neutral';
+    const scoreCards = (scenario.fairness || []).map(candidate => {
+      const rows = Object.entries(report.weights || {}).map(([key, weight]) => {
+        const input = Number(candidate.components?.[key] || 0), contribution = input * Number(weight) * 100;
+        return `<div class="demo-score-row"><span>${esc(labels[key] || key)}</span><span>${input.toFixed(2)} × ${Number(weight).toFixed(2)}</span><b>${contribution.toFixed(1)}</b><i style="--part:${Math.max(0,Math.min(100,contribution))}%"></i></div>`;
+      }).join('');
+      return `<article class="demo-score-card"><header><b>${esc(candidate.label)}</b><strong>${(Number(candidate.score)*100).toFixed(1)}<small>/100</small></strong></header>${rows}<footer>Weighted total = sum of the five contributions</footer></article>`;
+    }).join('');
+    root.innerHTML = `<div class="demo-player-top"><div><span class="demo-kicker">ILLUSTRATIVE SCENARIO · POLICY SNAPSHOT</span><h2>${esc(scenario.title)}</h2></div><button class="ghost" data-player="present">${root.classList.contains('demo-presentation') ? 'Exit recording view' : 'Recording view'}</button></div>
+      <div class="demo-player-controls"><select aria-label="Choose demo scenario" data-player-scenario>${scenarios.map((s,i) => `<option value="${i}" ${i === player.scenario ? 'selected' : ''}>${esc(s.title)}</option>`).join('')}</select><button class="ghost" data-player="reset">↺ Restart</button><button class="ghost" data-player="back" ${player.scenario === 0 && player.step === 0 ? 'disabled' : ''}>← Back</button><button class="primary" data-player="play">${player.playing ? 'Pause' : '▶ Play'}</button><button class="ghost" data-player="next" ${final ? 'disabled' : ''}>Next →</button><select aria-label="Playback speed" data-player-speed>${[3000,5000,8000].map(ms => `<option value="${ms}" ${player.delay === ms ? 'selected' : ''}>${ms/1000}s / step</option>`).join('')}</select></div>
+      <div class="demo-progress">${scenario.timeline.map((s,i) => `<button aria-label="Step ${i+1}: ${esc(s.label)}" aria-current="${i === player.step ? 'step' : 'false'}" data-player-step="${i}" class="${i === player.step ? 'active' : i < player.step ? 'done' : ''}"><span>${i+1}</span>${esc(s.label)}</button>`).join('')}</div>
+      <div class="demo-live-heading" aria-live="polite"><div class="demo-clock">${esc(step.time)}<small>Scenario clock</small></div><div><span class="demo-kicker">STEP ${player.step+1} OF ${scenario.timeline.length} · ${esc(step.kind)}</span><h3>${esc(step.label)}</h3><p>${esc(step.detail)}</p></div></div>
+      <div class="demo-board"><section><h3>Mission queue</h3>${frame.missions.length ? frame.missions.map(m => `<article class="demo-entity ${tone(m.status)}"><small>${esc(m.id)}</small><b>${esc(m.name)}</b><span class="demo-entity-status">${esc(m.status)}</span></article>`).join('') : '<div class="demo-entity neutral"><b>No requests yet</b><span>Publish the resource first</span></div>'}</section><section class="demo-routing"><h3>Allocation logic</h3>${frame.links.map(link => `<div class="demo-route ${tone(link.status)}"><b>${esc(link.mission)}</b><span>→</span><b>${esc(frame.resources[link.resource]?.name)}</b><small>${esc(link.status)}</small></div>`).join('') || '<div class="demo-rule">Resources enter the pool before requests are submitted.</div>'}<div class="demo-rule"><small>RULE IN EFFECT</small>${esc(frame.rule)}</div>${frame.credit_delta ? `<div class="demo-credit">Provider credit change <strong>${frame.credit_delta}</strong></div>` : ''}</section><section><h3>Resource pool</h3>${frame.resources.map(r => `<article class="demo-entity ${tone(r.status)}"><small>CAPACITY ${r.capacity} · ${r.booked_by || /unavailable|occupied/i.test(r.status) ? '0' : '1'} FREE SLOT</small><b>${esc(r.name)}</b><span class="demo-entity-status">${esc(r.status)}</span><div class="demo-capacity"><i class="${r.booked_by ? 'booked' : /unavailable|occupied/i.test(r.status) ? 'blocked' : ''}"></i><span>${r.booked_by ? `Booking: ${esc(r.booked_by)}` : /unavailable|occupied/i.test(r.status) ? 'Not assignable' : 'No booking yet'}</span></div></article>`).join('')}</section></div>
+      ${frame.show_scores ? `<section class="demo-live-scores"><h3>Why this order? <small>Input × weight × 100 = points</small></h3><div class="fairness-grid">${scoreCards}</div></section>` : `<div class="demo-score-placeholder">${scenario.key === 'replacement' ? 'The original booking is released. A proposed replacement is not a booking until the requester confirms.' : 'Fairness is evaluated during the batch. Before the cutoff, requests remain open.'}</div>`}
+      <div class="demo-narration"><span>${player.step === scenario.timeline.length-1 ? 'OUTCOME' : 'WHAT CHANGED'}</span><strong>${esc(player.step === scenario.timeline.length-1 ? scenario.outcome : step.detail)}</strong></div>`;
+    root.querySelectorAll('[data-player]').forEach(button => button.addEventListener('click', () => {
+      const action = button.dataset.player;
+      if (action === 'present') { root.classList.toggle('demo-presentation'); paintDemo(); }
+      if (action === 'play') { if (player.playing) { stopDemo(); paintDemo(); } else { if (final) { player.scenario=0; player.step=0; } playDemo(); } }
+      if (action === 'back' || action === 'next') { stopDemo(); moveDemo(action === 'back' ? -1 : 1); }
+      if (action === 'reset') { stopDemo(); player.step=0; paintDemo(); }
+    }));
+    root.querySelector('[data-player-scenario]').addEventListener('change', event => { stopDemo(); player.scenario=Number(event.target.value); player.step=0; paintDemo(); });
+    root.querySelector('[data-player-speed]').addEventListener('change', event => { player.delay=Number(event.target.value); if (player.playing) playDemo(); else paintDemo(); });
+    root.querySelectorAll('[data-player-step]').forEach(button => button.addEventListener('click', () => { stopDemo(); player.step=Number(button.dataset.playerStep); paintDemo(); }));
   }
   function evidenceSource(item) {
     const source = item?.endpoint || item?.url || item?.data || "";
@@ -87,7 +151,7 @@
   function renderDemoReport(report) {
     if (report.legacy) return `<pre class="demo-report">${esc(report.legacy)}</pre>`;
     const scenarios = report.scenarios || [];
-    return scenarios.map((scenario) => `<article class="demo-scenario"><div class="demo-scenario-head"><div><span class="demo-kicker">${esc(scenario.key || 'scenario')}</span><h2>${esc(scenario.title)}</h2><p>${esc(scenario.purpose)}</p></div><span class="pill">${esc(scenario.outcome || 'Completed')}</span></div><div class="demo-meta"><div><small>Participants</small><strong>${(scenario.actors || []).map(esc).join(' · ')}</strong></div><div><small>Batch clock</small><strong>Submitted ${esc(scenario.batch?.submitted_at)} → Deadline ${esc(scenario.batch?.cutoff_at)} → Executed ${esc(scenario.batch?.executed_at)}</strong></div></div><div class="demo-section"><h3>Process timeline</h3><div class="demo-timeline">${(scenario.timeline || []).map((step, index) => `<div class="demo-step"><div class="demo-step-marker ${demoKindClass(step.kind)}">${index + 1}</div><div class="demo-step-body"><div class="demo-step-top"><b>${esc(step.label)}</b><span>${esc(step.time)}</span></div><p>${esc(step.detail)}</p><span class="demo-state ${demoKindClass(step.kind)}">${esc(step.status)}</span></div></div>`).join('')}</div></div><div class="demo-section"><div class="demo-section-title"><h3>Fairness scoring process</h3><span class="demo-formula">${esc(report.formula || 'Calculated from the policy snapshot')}</span></div><div class="fairness-grid">${(scenario.fairness || []).map(candidate => `<div class="fairness-card"><div class="fairness-card-top"><b>${esc(candidate.label)}</b><strong>${Math.round(Number(candidate.score || 0) * 100)}<small>/100</small></strong></div><div class="score-track"><i style="width:${Math.max(0,Math.min(100,Number(candidate.score || 0) * 100))}%"></i></div><div class="fairness-components">${Object.entries(candidate.components || {}).map(([key,val]) => `<span><em>${esc(key)}</em>${esc(val)}</span>`).join('')}</div><div class="fairness-result ${candidate.result === 'winner' || candidate.result === 'allocated' ? 'good' : 'waiting'}">${candidate.result === 'winner' || candidate.result === 'allocated' ? '✓ ' : '↳ '}${esc(candidate.result)} · ${esc(candidate.reason)}</div></div>`).join('')}</div></div><div class="demo-section demo-assertions"><h3>Verifiable assertions</h3><div>${(scenario.assertions || []).map(item => `<span>✓ ${esc(item)}</span>`).join('')}</div></div></article>`).join('');
+    return scenarios.map((scenario) => `<article class="demo-scenario"><div class="demo-scenario-head"><div><span class="demo-kicker">${esc(scenario.key || 'scenario')}</span><h2>${esc(scenario.title)}</h2><p>${esc(scenario.purpose)}</p></div><span class="pill">${esc(scenario.outcome || 'Completed')}</span></div><div class="demo-meta"><div><small>Participants</small><strong>${(scenario.actors || []).map(esc).join(' · ')}</strong></div><div><small>Batch clock</small><strong>Submitted ${esc(scenario.batch?.submitted_at)} → Deadline ${esc(scenario.batch?.cutoff_at)} → Executed ${esc(scenario.batch?.executed_at)}</strong></div></div><div class="demo-section"><h3>Process timeline</h3><div class="demo-timeline">${(scenario.timeline || []).map((step, index) => `<div class="demo-step"><div class="demo-step-marker ${demoKindClass(step.kind)}">${index + 1}</div><div class="demo-step-body"><div class="demo-step-top"><b>${esc(step.label)}</b><span>${esc(step.time)}</span></div><p>${esc(step.detail)}</p><span class="demo-state ${demoKindClass(step.kind)}">${esc(step.status)}</span></div></div>`).join('')}</div></div><div class="demo-section"><div class="demo-section-title"><h3>Fairness scoring process</h3><span class="demo-formula">${esc(report.formula || 'Calculated from the policy snapshot')}</span></div><div class="fairness-grid">${(scenario.fairness || []).map(candidate => `<div class="fairness-card"><div class="fairness-card-top"><b>${esc(candidate.label)}</b><strong>${Math.round(Number(candidate.score || 0) * 100)}<small>/100</small></strong></div><div class="score-track"><i style="width:${Math.max(0,Math.min(100,Number(candidate.score || 0) * 100))}%"></i></div><div class="fairness-components">${Object.entries(candidate.components || {}).map(([key,val]) => `<span><em>${esc(key)}</em>${esc(val)}</span>`).join('')}</div><div class="fairness-result ${candidate.result === 'winner' || candidate.result === 'allocated' ? 'good' : 'waiting'}">${candidate.result === 'winner' || candidate.result === 'allocated' ? '✓ ' : '↳ '}${esc(candidate.result)} · ${esc(candidate.reason)}</div></div>`).join('')}</div></div><div class="demo-section demo-assertions"><h3>Scenario checkpoints</h3><div>${(scenario.assertions || []).map(item => `<span>✓ ${esc(item)}</span>`).join('')}</div></div></article>`).join('');
   }
   function renderDisputes() {
     const rows = (state.data.disputes || []).map(d => { const evidence = Array.isArray(d.evidence) ? d.evidence : []; const amount = Number(d.compensation_amount || 0); const accused = d.accused?.short_name || d.accused_org_id || "Unknown"; const detailButton = `<button data-action="dispute-detail" data-id="${d.id}">View details</button>`; const action = d.status === "open" ? `<div class="row-actions">${detailButton}<button data-action="dispute-review" data-kind="upheld" data-id="${d.id}">Uphold and reduce credit</button><button data-action="dispute-review" data-kind="rejected" data-id="${d.id}">Reject</button></div>` : d.status === "awaiting_victim" ? `<div class="row-actions">${detailButton}<span class="muted">Frozen; waiting for the affected organization to mark it resolved</span></div>` : `<div class="row-actions">${detailButton}<span class="muted">${esc(d.resolution_description || "Process complete")}</span></div>`; const evidenceNames = evidence.map(item => esc(item.name)).join(', '); return `<tr><td>#${d.id}<br><span class="muted">Mission ${d.mission_id}</span></td><td><b>${esc(d.category)}</b><br>${esc(d.description)}<br><span class="muted">Affected organization: ${esc(d.reporter?.short_name || d.reporter_org_id)} · Provider at fault: ${esc(accused)}</span></td><td>${amount > 0 ? `<b>HKD ${amount.toFixed(2)}</b><br>` : ''}${evidence.length ? `<span class="pill">${evidence.length} evidence file(s)</span><br><span class="muted">${evidenceNames}</span>` : '<span class="muted">No compensation requested</span>'}</td><td>${statusPill(d.status)}<br><span class="muted">${esc(d.compensation_status || '')}</span></td><td>${action}</td></tr>`; });
@@ -105,14 +169,14 @@
     $("tab-history").innerHTML = `<h1>Persistent history</h1><p>All resource, Mission, dispute, and platform changes are written to the same business database, which both apps read.</p><div class="toolbar"><button data-action="refresh">Refresh</button></div>${table(["Item","Change","Current status","Time"], rows)}`;
     bindActions();
   }
-  function showTab(name) { state.tab = name; document.querySelectorAll(".admin-tab-panel").forEach(p => p.hidden = p.id !== `tab-${name}`); document.querySelectorAll(".admin-tab").forEach(b => b.classList.toggle("active", b.dataset.tab === name)); }
+  function showTab(name) { if (name !== "demo") stopDemo(); state.tab = name; document.querySelectorAll(".admin-tab-panel").forEach(p => p.hidden = p.id !== `tab-${name}`); document.querySelectorAll(".admin-tab").forEach(b => b.classList.toggle("active", b.dataset.tab === name)); }
   function bindActions() {
     document.querySelectorAll("[data-action]").forEach((button) => { if (button.dataset.bound) return; button.dataset.bound = "1"; button.addEventListener("click", async () => {
       const action = button.dataset.action;
       try {
         if (action === "refresh") return load();
         if (action === "run-batch") { await api("/api/admin/allocation/run", {method:"POST", body:JSON.stringify({})}); toast("Due batch completed"); return load(); }
-        if (action === "run-demo") { button.disabled = true; const result = await api("/api/admin/demo/run", {method:"POST",body:JSON.stringify({scenario: button.dataset.scenario || "all"})}); toast("Explainable demo completed"); await load(); if (result.report) { const node = $("demo-report"); if (node) node.innerHTML = renderDemoReport(result.report); } return; }
+        if (action === "run-demo") { button.disabled = true; const result = await api("/api/admin/demo/run", {method:"POST",body:JSON.stringify({scenario: button.dataset.scenario || "all"})}); toast("Explainable demo completed"); await load(); if (result.report) { setDemoReport(result.report); playDemo(); } return; }
         if (action === "dispute-detail") { showDisputeDetail(button.dataset.id); return; }
         if (action === "save-config") { const weights = {}; document.querySelectorAll("[data-weight]").forEach(i => weights[i.dataset.weight] = Number(i.value)); await api("/api/admin/config", {method:"PATCH",body:JSON.stringify({scheduler_enabled:Number($("scheduler-enabled").value),interval_seconds:Number($("scheduler-interval").value),weights})}); toast("Scheduler settings saved"); return load(); }
         if (action === "mission-action") { const payload = {}; if (button.dataset.kind === "no-show") { const mission = (state.data.missions || []).find(item => String(item.id) === String(button.dataset.id)); const providerIds = []; const plan = (mission?.plans || []).find(item => item.id === mission.allocated_plan_id) || (mission?.plans || [])[0]; (plan?.items || []).forEach(item => { const resource = (state.data.resources || []).find(candidate => Number(candidate.id) === Number(item.resource_id)); const ownerId = resource?.owner_org_id ?? item.owner_org_id; if (ownerId && !providerIds.includes(Number(ownerId))) providerIds.push(Number(ownerId)); }); if (providerIds.length > 1) { const selected = window.prompt(`Enter the provider organization ID at fault (options: ${providerIds.join(', ')})`, String(providerIds[0])); if (selected === null) return; payload.provider_org_id = Number(selected); } else if (providerIds.length === 1) payload.provider_org_id = providerIds[0]; } await api(`/api/admin/missions/${button.dataset.id}/${button.dataset.kind}`, {method:"POST",body:JSON.stringify(payload)}); toast(button.dataset.kind === "no-show" ? "Provider credit reduced and no-show recorded" : "Mission status updated"); return load(); }

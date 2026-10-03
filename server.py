@@ -355,12 +355,14 @@ def init_db() -> None:
             db.execute("INSERT INTO admin_config(id,weights) VALUES(1,?) ON CONFLICT (id) DO NOTHING", (dumps({"urgency":.3,"contribution":.2,"credit":.15,"access_fairness":.2,"alternative_scarcity":.15}),))
             if db.execute("SELECT COUNT(*) AS count FROM organizations").fetchone()["count"] == 0:
                 seed_db(db)
+            refresh_open_mission_plans(db)
             for m in db.execute("SELECT * FROM missions WHERE status IN ('allocated','in_use','completed') AND allocated_plan_id IS NOT NULL").fetchall():
                 for item in next((p for p in loads(m["plans"],[]) if p.get("id")==m["allocated_plan_id"]),{}).get("items",[]):
                     db.execute("INSERT INTO bookings(mission_id,resource_id,start_at,end_at,quantity,status,created_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT (mission_id,resource_id) DO NOTHING", (m["id"],item["resource_id"],m["start_at"],m["end_at"],1,"active",m["created_at"]))
             db.execute("UPDATE resources SET external_hourly_cost=hourly_value WHERE external_hourly_cost=0")
             backfill_history(db)
             backfill_decisions(db)
+            backfill_demo_reports(db)
             db.commit()
         return
     # Existing data is preserved. This migration only adds missing schema and
@@ -400,6 +402,7 @@ def init_db() -> None:
         db.execute("INSERT OR IGNORE INTO admin_config(id,weights) VALUES(1,?)", (dumps({"urgency":.3,"contribution":.2,"credit":.15,"access_fairness":.2,"alternative_scarcity":.15}),))
         if db.execute("SELECT COUNT(*) FROM organizations").fetchone()[0] == 0:
             seed_db(db)
+        refresh_open_mission_plans(db)
         # Backfill bookings for the original MVP's allocated sample mission once.
         for m in db.execute("SELECT * FROM missions WHERE status IN ('allocated','in_use','completed') AND allocated_plan_id IS NOT NULL").fetchall():
             for item in next((p for p in loads(m["plans"],[]) if p.get("id")==m["allocated_plan_id"]),{}).get("items",[]):
@@ -409,6 +412,7 @@ def init_db() -> None:
         db.execute("UPDATE resources SET external_hourly_cost=hourly_value WHERE external_hourly_cost=0")
         backfill_history(db)
         backfill_decisions(db)
+        backfill_demo_reports(db)
         db.commit()
 
 
@@ -587,6 +591,110 @@ def backfill_decisions(db: sqlite3.Connection) -> None:
         record_decision(db, mission, fairness, plan, "seeded", weights, "Historical demo allocation preserved during database migration.")
 
 
+
+# Demo reports created before the UI language migration can still be stored in
+# the database. Keep a small compatibility map so those historical reports are
+# upgraded in place instead of showing mixed-language content in the console.
+LEGACY_DEMO_TRANSLATIONS = {
+    "同一设备冲突：fairness 决定顺序": "Same-device conflict: fairness decides the order",
+    "两个 Mission 在同一时段申请一台相机，观察截止后才分配以及候补结果。": "Two Missions request one camera for overlapping times; allocation happens after the deadline and produces a clear waitlist result.",
+    "资源 R-01 · Camera A": "Resource R-01 · Camera A",
+    "截止前只收集偏好；截止后冻结并批量处理": "Collect preferences before the deadline; freeze and process them in a batch after the deadline",
+    "资源上线": "Resource published",
+    "Camera A 可用 1 个容量，状态 available。": "Camera A has one available slot and is marked available.",
+    "M-101 提交": "M-101 submitted",
+    "提交偏好：Camera A；Mission 保持 open。": "Preference submitted: Camera A; the Mission remains open.",
+    "M-102 提交": "M-102 submitted",
+    "提交偏好：Camera A；时间段与 M-101 重叠。": "Preference submitted: Camera A; its time overlaps with M-101.",
+    "申请窗口截止": "Request window closed",
+    "冻结两个 Mission 的方案顺序，不再即时分配。": "Freeze both Missions' option order; do not allocate immediately.",
+    "发现容量冲突": "Capacity conflict detected",
+    "同一资源同一时段只能满足一个 Mission，进入公平排序。": "Only one Mission can use the same resource at the same time, so both candidates enter fairness ranking.",
+    "批次完成": "Batch completed",
+    "M-101 获批 Camera A；M-102 进入候补并保留替代方案。": "M-101 is approved for Camera A; M-102 is waitlisted with alternative options preserved.",
+    "总分最高，且第一偏好可用": "Highest total score, and the first preference is feasible",
+    "资源已被更高分 Mission 占用": "The resource was assigned to the higher-scoring Mission",
+    "M-101 → approved · Camera A；M-102 → waitlisted · 可确认替代方案": "M-101 → approved · Camera A; M-102 → waitlisted · An alternative option can be confirmed",
+    "open 状态持续到截止": "Open status is preserved until the deadline",
+    "冲突被识别": "The conflict is detected",
+    "fairness 总分决定处理顺序": "The fairness total score decides processing order",
+    "未获批者进入候补": "The unapproved request enters the waitlist",
+    "撤回与释放：冲突在 batch 前消失": "Withdrawal and release: the conflict disappears before the batch",
+    "一个申请人在截止前撤回，系统释放需求，不提前消耗资源。": "One requester withdraws before the deadline, so the system releases the request without consuming the resource early.",
+    "资源 R-03 · Rehearsal Room": "Resource R-03 · Rehearsal Room",
+    "撤回只改变申请状态，不创建预约": "Withdrawal changes the request status only; it does not create a booking",
+    "两份申请进入队列": "Two requests enter the queue",
+    "M-201、M-202 都申请 Rehearsal Room，均为 open。": "M-201 and M-202 both request the Rehearsal Room and remain open.",
+    "M-201 主动撤回": "M-201 withdraws",
+    "撤回记录写入历史，未创建 booking。": "The withdrawal is recorded in history; no booking is created.",
+    "重新计算冲突": "Conflict recalculated",
+    "只剩 M-202 竞争，资源容量恢复为 1。": "Only M-202 remains in the competition, so resource capacity returns to one.",
+    "批次读取最新状态，跳过 withdrawn Mission。": "The batch reads the latest status and skips the withdrawn Mission.",
+    "M-202 直接获批，M-201 保留 withdrawn 历史。": "M-202 is approved directly; M-201 keeps its withdrawn history.",
+    "唯一仍处于 open 的申请": "The only request still open",
+    "撤回可追溯": "Withdrawal is traceable",
+    "撤回不会锁定资源": "Withdrawal does not lock the resource",
+    "batch 使用截止时的最新状态": "The batch uses the latest status at the deadline",
+    "违约与替换：批准后仍需用户确认": "Provider breach and replacement: user confirmation is still required",
+    "资源提供方 no-show，系统释放原预约并提出替代方案，但不替用户自动接受。": "The resource provider does not show up. The system releases the original booking and proposes an alternative without accepting it for the user.",
+    "资源 R-07 · Studio A": "Resource R-07 · Studio A",
+    "替代资源 R-08 · Studio B": "Alternative resource R-08 · Studio B",
+    "替换方案必须由 Mission requester 确认": "The Mission requester must confirm a replacement option",
+    "原方案获批": "Original option approved",
+    "M-301 获批 Studio A，booking active。": "M-301 is approved for Studio A and the booking is active.",
+    "提供方 no-show": "Provider no-show",
+    "管理员记录违约，原资源不可用，信用事件 -5。": "The admin records the breach; the original resource is unavailable and a -5 credit event is recorded.",
+    "生成替代方案": "Replacement option generated",
+    "Studio B 满足时间与能力要求，Mission 标记 replacement_pending。": "Studio B meets the time and capability requirements; the Mission is marked replacement_pending.",
+    "等待 requester 确认": "Waiting for requester confirmation",
+    "用户端只看到替代方案待确认，不会被后台静默替换。": "The user app shows only that a replacement is awaiting confirmation; the backend never replaces it silently.",
+    "确认后重新预约": "Rebook after confirmation",
+    "确认 Studio B 后建立新 booking，原 booking 保留释放记录。": "After Studio B is confirmed, a new booking is created and the original booking keeps its release record.",
+    "原方案已按批次获批；替换不重新暗中排序": "The original option was approved by the batch; replacement does not silently rerank the Mission",
+    "违约留下信用事件": "The breach leaves a credit event",
+    "原预约释放可追溯": "Release of the original booking is traceable",
+    "替代方案需要用户确认": "The replacement requires user confirmation",
+    "偏好顺序：第一方案不可用时尝试第二方案": "Preference order: try the second option when the first is unavailable",
+    "展示用户提交的方案顺序如何被 batch 使用，以及资源冲突检查发生在哪里。": "Show how the batch uses the requester's option order and where resource conflict checks happen.",
+    "方案 P1 · Lab A": "Option P1 · Lab A",
+    "方案 P2 · Lab B": "Option P2 · Lab B",
+    "按 requester 提交的偏好顺序尝试可行方案": "Try feasible options in the requester's submitted order",
+    "提交方案顺序": "Option order submitted",
+    "偏好为 P1 → P2，顺序写入 decision snapshot。": "Preference is P1 → P2; the order is saved in the decision snapshot.",
+    "P1 被占用": "P1 is occupied",
+    "Lab A 出现时间冲突，P1 feasibility=false。": "Lab A has a time conflict, so P1 feasibility=false.",
+    "冻结并执行": "Freeze and execute",
+    "batch 不改变用户排序，只跳过不可行 P1。": "The batch does not change the user's order; it skips infeasible P1 only.",
+    "选择 P2": "Choose P2",
+    "Lab B 可用，按用户顺序选择第二方案并批准。": "Lab B is available, so the second option is selected and approved in the user's order.",
+    "fairness 决定 Mission 处理顺序；方案选择仍服从提交偏好": "Fairness decides Mission processing order; option selection still follows the submitted preference",
+    "偏好顺序可解释": "Preference order is explainable",
+    "可行性检查先于方案选择": "Feasibility is checked before option selection",
+    "决策快照包含原始偏好": "The decision snapshot preserves the original preference",
+    "P1 → infeasible；P2 → approved · decision snapshot 保存 P1 → P2": "P1 → infeasible; P2 → approved · decision snapshot preserves P1 → P2",
+    "总分 = urgency×0.30 + contribution×0.20 + credit×0.15 + access_fairness×0.20 + alternative_scarcity×0.15": "Total score = urgency×0.30 + contribution×0.20 + credit×0.15 + access_fairness×0.20 + alternative_scarcity×0.15",
+}
+
+
+def translate_demo_value(value):
+    if isinstance(value, str):
+        return LEGACY_DEMO_TRANSLATIONS.get(value, value)
+    if isinstance(value, list):
+        return [translate_demo_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: translate_demo_value(item) for key, item in value.items()}
+    return value
+
+
+def backfill_demo_reports(db: sqlite3.Connection) -> None:
+    """Translate reports created by the pre-English admin console."""
+    for row in db.execute("SELECT id,report FROM demo_runs ORDER BY id").fetchall():
+        report = loads(row["report"], {})
+        translated = translate_demo_value(report)
+        if translated != report:
+            db.execute("UPDATE demo_runs SET report=? WHERE id=?", (dumps(translated), row["id"]))
+
+
 def record_credit_event(db: sqlite3.Connection, organization_id: int, event_type: str, delta: float, mission_id: int | None = None, details: str = "") -> float:
     row = db.execute("SELECT credit_score FROM organizations WHERE id=?", (organization_id,)).fetchone()
     if not row:
@@ -628,29 +736,50 @@ KEYWORD_REQUIREMENTS = [
 ]
 
 
-def parse_requirements(text: str) -> list[dict]:
+def parse_requirements(text: str, resource_types: list[str] | None = None) -> list[dict]:
+    """Turn a request into mandatory, typed requirements.
+
+    The selected resource types are an explicit user constraint. Keyword
+    detection still creates the more precise capability requirements, while a
+    selected type with no detected keyword gets a conservative generic
+    requirement instead of allowing every resource to match it.
+    """
     lower = text.lower()
+    allowed = [str(item).strip().lower() for item in (resource_types or []) if str(item).strip().lower() in {"equipment", "space", "skill", "people"}]
     requirements = []
     used = set()
     for keywords, rtype, capability, label in KEYWORD_REQUIREMENTS:
-        if any(k.lower() in lower for k in keywords) and (rtype, capability) not in used:
+        if any(k.lower() in lower for k in keywords) and (not allowed or rtype in allowed) and (rtype, capability) not in used:
             requirements.append({"key": f"req-{len(requirements)+1}", "label": label, "type": rtype, "capability": capability, "mandatory": True})
             used.add((rtype, capability))
+    if allowed:
+        detected_types = {item["type"] for item in requirements}
+        for rtype in allowed:
+            if rtype not in detected_types:
+                requirements.append({"key": f"req-{len(requirements)+1}", "label": f"{rtype.title()} resource", "type": rtype, "capability": lower[:120] or rtype, "mandatory": True, "generic": True})
     if not requirements:
-        requirements = [{"key": "req-1", "label": "General resource", "type": "equipment", "capability": lower[:80] or "general support", "mandatory": True}]
+        requirements = [{"key": "req-1", "label": "General resource", "type": "equipment", "capability": lower[:80] or "general support", "mandatory": True, "generic": True}]
     return requirements
 
 
 def text_match(need: str, have: str) -> float:
-    a = set(re.findall(r"[a-z0-9]+", need.lower()))
-    b = set(re.findall(r"[a-z0-9]+", have.lower()))
+    a = set(re.findall(r"[a-z0-9]+", (need or "").lower()))
+    b = set(re.findall(r"[a-z0-9]+", (have or "").lower()))
     if not a or not b:
-        return 0.35
+        return 0.0
     overlap = len(a & b) / max(len(a), 1)
-    return min(1.0, 0.35 + overlap * 0.65)
+    return min(1.0, overlap)
 
 
 def build_plans(db: sqlite3.Connection, requirements: list[dict], location: str, start: str, end: str, requester_id: int) -> list[dict]:
+    """Build only complete plans whose type, capability and time all match.
+
+    A plan is valid only when every mandatory requirement has one distinct
+    resource. Capability overlap is required for non-generic requirements;
+    this prevents an iPhone, for example, from satisfying a robotics request
+    merely because both are equipment. Existing overlapping bookings are also
+    excluded when plans are generated so the user does not see stale options.
+    """
     resources = [dict(r) for r in db.execute("SELECT r.*, o.short_name AS owner_name, o.credit_score FROM resources r JOIN organizations o ON o.id=r.owner_org_id WHERE r.status='available' AND o.suspended=0").fetchall()]
     start_dt, end_dt = parse_dt(start), parse_dt(end)
     choices = []
@@ -662,20 +791,32 @@ def build_plans(db: sqlite3.Connection, requirements: list[dict], location: str,
                 continue
             if rs > start_dt or re_ < end_dt:
                 continue
-            cap = text_match(req["capability"], resource["capability"] + " " + resource["features"])
-            loc = text_match(location, resource["location"]) if location else 0.6
-            score = 0.50 * cap + 0.30 * 1.0 + 0.20 * loc
+            used = 0.0
+            for booking in db.execute("SELECT quantity,start_at,end_at FROM bookings WHERE resource_id=? AND status='active'", (resource["id"],)).fetchall():
+                bs, be = parse_dt(booking["start_at"]), parse_dt(booking["end_at"])
+                if bs and be and bs < end_dt and start_dt < be:
+                    used += float(booking["quantity"] or 0)
+            if used + 1 > float(resource.get("capacity") or 1):
+                continue
+            cap = text_match(req.get("capability", ""), f'{resource.get("capability", "")} {resource.get("features", "")}')
+            if not req.get("generic") and cap < 0.35:
+                continue
+            loc = text_match(location, resource.get("location", "")) if location else 0.5
+            # Match formula: capability 60%, time feasibility 20%, location 20%.
+            score = 0.60 * (cap if not req.get("generic") else 0.5) + 0.20 + 0.20 * loc
             matching.append((score, resource))
         matching.sort(key=lambda item: (-item[0], item[1]["id"]))
-        choices.append((req, matching[:5]))
+        choices.append((req, matching[:8]))
     if any(not matches for _, matches in choices):
         return []
     plans = []
-    for index, combo in enumerate(itertools.product(*[matches for _, matches in choices]), start=1):
-        if len({item[1]["id"] for item in combo}) != len(combo):
+    seen = set()
+    for combo in itertools.product(*[matches for _, matches in choices]):
+        resource_ids = tuple(item[1]["id"] for item in combo)
+        if len(set(resource_ids)) != len(resource_ids) or resource_ids in seen:
             continue
-        items = []
-        scores = []
+        seen.add(resource_ids)
+        items, scores = [], []
         for (req, _), (score, resource) in zip(choices, combo):
             items.append({
                 "requirement": req["label"], "requirement_key": req["key"], "resource_id": resource["id"],
@@ -683,14 +824,29 @@ def build_plans(db: sqlite3.Connection, requirements: list[dict], location: str,
                 "location": resource["location"], "score": round(score, 3), "hourly_value": resource["hourly_value"],
             })
             scores.append(score)
+        index = len(plans) + 1
         plans.append({
-            "id": f"plan-{index}", "label": f"Plan {chr(64+index)}", "match_score": round(sum(scores)/len(scores), 3),
+            "id": f"plan-{index}", "label": f"Plan {chr(64 + index) if index <= 26 else index}", "match_score": round(sum(scores) / len(scores), 3),
             "items": items, "estimated_value": round(sum(item["hourly_value"] for item in items), 2),
-            "tradeoff": "Best coverage and closest location" if index == 1 else "More resilient alternative with a different owner",
+            "tradeoff": "Best capability and location match" if index == 1 else "Feasible alternative with different resources",
         })
         if len(plans) >= 5:
             break
     return plans
+
+
+def refresh_open_mission_plans(db: sqlite3.Connection) -> None:
+    """Rebuild plans created by older releases using the current matcher."""
+    rows = db.execute("SELECT * FROM missions WHERE status IN ('open','waitlisted')").fetchall()
+    for row in rows:
+        requirements = loads(row["requirements"], [])
+        if not requirements:
+            requirements = parse_requirements(f'{row["title"]} {row["description"]}')
+        plans = build_plans(db, requirements, row["location"], row["start_at"], row["end_at"], row["requester_org_id"])
+        valid = {plan["id"] for plan in plans}
+        old_preferences = loads(row["preferences"], [])
+        preferences = [plan_id for plan_id in old_preferences if plan_id in valid] or [plan["id"] for plan in plans]
+        db.execute("UPDATE missions SET requirements=?,plans=?,preferences=?,updated_at=? WHERE id=?", (dumps(requirements), dumps(plans), dumps(preferences), now_iso(), row["id"]))
 
 
 def org_fairness(org: sqlite3.Row, mission: sqlite3.Row, plan_count: int, weights: dict | None = None) -> dict:
@@ -735,18 +891,43 @@ def row_to_dispute(row: sqlite3.Row, db: sqlite3.Connection, include_evidence: b
     return item
 
 
-def row_to_mission(row: sqlite3.Row, db: sqlite3.Connection, detail: bool = False) -> dict:
+def mission_allocation_details(db: sqlite3.Connection, row: sqlite3.Row) -> list[dict]:
+    """Return the exact resources reserved by the approved plan."""
+    plan_id = row["allocated_plan_id"]
+    if not plan_id:
+        return []
+    plan = next((p for p in loads(row["plans"], []) if p.get("id") == plan_id), None)
+    if not plan:
+        return []
+    bookings = {
+        int(item["resource_id"]): dict(item)
+        for item in db.execute(
+            "SELECT b.resource_id,b.status AS booking_status,b.start_at AS booking_start,b.end_at AS booking_end,r.name,r.type,r.location,r.owner_org_id,o.short_name AS owner_name "
+            "FROM bookings b JOIN resources r ON r.id=b.resource_id JOIN organizations o ON o.id=r.owner_org_id WHERE b.mission_id=?",
+            (row["id"],),
+        ).fetchall()
+    }
+    result = []
+    for item in plan.get("items", []):
+        booking = bookings.get(int(item["resource_id"]), {})
+        result.append({**item, "booking_status": booking.get("booking_status", "active"), "booking_start": booking.get("booking_start", row["start_at"]), "booking_end": booking.get("booking_end", row["end_at"]), "owner": booking.get("owner_name", item.get("owner")), "owner_org_id": booking.get("owner_org_id", item.get("owner_org_id")), "resource": booking.get("name", item.get("resource")), "type": booking.get("type", item.get("type")), "location": booking.get("location", item.get("location"))})
+    return result
+
+
+def row_to_mission(row: sqlite3.Row, db: sqlite3.Connection, detail: bool = False, viewer_org_id: int | None = None) -> dict:
     item = dict(row)
     item["requirements"] = loads(item.pop("requirements", "[]"), [])
     item["plans"] = loads(item.pop("plans", "[]"), [])
     item["preferences"] = loads(item.pop("preferences", "[]"), [])
     org = db.execute("SELECT * FROM organizations WHERE id=?", (item["requester_org_id"],)).fetchone()
     item["requester"] = dict(org) if org else None
-    # Keep weighting policy server-side; the client only receives the total.
     full_fairness = org_fairness(org, row, len(item["plans"])) if org else None
     item["fairness"] = {"score": full_fairness["score"]} if full_fairness else None
-    # Detailed Mission views include the reporter's dispute state, so the
-    # affected organization can acknowledge resolution from the user client.
+    allocated = mission_allocation_details(db, row)
+    item["allocated_resources"] = allocated
+    item["viewer_role"] = "requester" if viewer_org_id is not None and int(viewer_org_id) == int(item["requester_org_id"]) else None
+    if viewer_org_id is not None and item["viewer_role"] is None and any(int(resource.get("owner_org_id")) == int(viewer_org_id) for resource in allocated):
+        item["viewer_role"] = "provider"
     if detail:
         item["disputes"] = [row_to_dispute(dispute, db, include_evidence=True) for dispute in db.execute("SELECT * FROM disputes WHERE mission_id=? ORDER BY id DESC", (item["id"],)).fetchall()]
     if not detail:
@@ -869,19 +1050,21 @@ class Handler(BaseHTTPRequestHandler):
                 rows = db.execute("SELECT r.*,o.short_name AS owner_name FROM resources r JOIN organizations o ON o.id=r.owner_org_id WHERE (r.status='available' AND o.suspended=0) OR r.owner_org_id=? ORDER BY r.status,r.name", (org["id"],)).fetchall()
                 self.send_json({"resources":[row_to_resource(r) for r in rows]}); return
             if path == "/api/missions":
-                org = self.user_org(db); rows=db.execute("SELECT * FROM missions WHERE requester_org_id=? ORDER BY deadline",(org["id"],)).fetchall()
-                self.send_json({"missions":[row_to_mission(r,db) for r in rows]}); return
+                org = self.user_org(db)
+                rows=db.execute("SELECT DISTINCT m.* FROM missions m LEFT JOIN bookings b ON b.mission_id=m.id LEFT JOIN resources br ON br.id=b.resource_id WHERE m.requester_org_id=? OR br.owner_org_id=? ORDER BY m.deadline,m.id",(org["id"],org["id"])).fetchall()
+                self.send_json({"missions":[row_to_mission(r,db,False,org["id"]) for r in rows]}); return
             match = re.fullmatch(r"/api/missions/(\d+)", path)
             if match:
-                org=self.user_org(db); row=db.execute("SELECT * FROM missions WHERE id=? AND requester_org_id=?",(int(match.group(1)),org["id"])).fetchone()
+                org=self.user_org(db)
+                row=db.execute("SELECT DISTINCT m.* FROM missions m LEFT JOIN bookings b ON b.mission_id=m.id LEFT JOIN resources br ON br.id=b.resource_id WHERE m.id=? AND (m.requester_org_id=? OR br.owner_org_id=?)",(int(match.group(1)),org["id"],org["id"])).fetchone()
                 if not row: self.send_json({"error":"Mission not found"},404); return
-                self.send_json({"mission":row_to_mission(row,db,True)}); return
+                self.send_json({"mission":row_to_mission(row,db,True,org["id"])}); return
             if path == "/api/metrics":
                 org=self.user_org(db); self.send_json({"metrics":get_metrics(db,org["id"])}); return
             if path == "/api/history":
                 org=self.user_org(db); self.send_json({"history":get_history(db,org["id"])}); return
             if path == "/api/profile":
-                org=self.user_org(db); own=[row_to_resource(r) for r in db.execute("SELECT r.*,o.short_name AS owner_name FROM resources r JOIN organizations o ON o.id=r.owner_org_id WHERE r.owner_org_id=? ORDER BY r.status,r.name",(org["id"],)).fetchall()]; self.send_json({"organization":dict(org),"resources":own,"metrics":get_metrics(db,org["id"]) }); return
+                org=self.user_org(db); own=[resource_with_usage(db, r) for r in db.execute("SELECT r.*,o.short_name AS owner_name FROM resources r JOIN organizations o ON o.id=r.owner_org_id WHERE r.owner_org_id=? ORDER BY r.status,r.name",(org["id"],)).fetchall()]; self.send_json({"organization":dict(org),"resources":own,"metrics":get_metrics(db,org["id"]) }); return
             if path == "/api/admin/bootstrap":
                 if not self.admin_ok(): self.send_json({"error":"Admin authentication required"},401); return
                 self.send_json(get_admin_bootstrap(db)); return
@@ -982,14 +1165,34 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc: self.send_json({"error":f"Server error: {exc}"},500); return
         self.send_error(HTTPStatus.NOT_FOUND)
 
+def resource_with_usage(db: sqlite3.Connection, row: sqlite3.Row) -> dict:
+    item = row_to_resource(row)
+    item["active_loans"] = [dict(loan) for loan in db.execute(
+        "SELECT b.id AS booking_id,b.status AS booking_status,b.start_at,b.end_at,m.id AS mission_id,m.title,m.requester_org_id,o.short_name AS requester_name "
+        "FROM bookings b JOIN missions m ON m.id=b.mission_id JOIN organizations o ON o.id=m.requester_org_id "
+        "WHERE b.resource_id=? AND b.status='active' ORDER BY b.start_at", (row["id"],)
+    ).fetchall()]
+    item["loaned"] = bool(item["active_loans"])
+    return item
+
+
 def get_bootstrap(db: sqlite3.Connection, organization_id: int = 1) -> dict:
     user = db.execute("SELECT * FROM organizations WHERE id=?", (organization_id,)).fetchone()
-    if not user: user = db.execute("SELECT * FROM organizations ORDER BY id LIMIT 1").fetchone()
-    missions = [row_to_mission(r, db) for r in db.execute("SELECT * FROM missions WHERE requester_org_id=? ORDER BY deadline", (user["id"],)).fetchall()]
-    resources = [row_to_resource(r) for r in db.execute("SELECT r.*,o.short_name AS owner_name FROM resources r JOIN organizations o ON o.id=r.owner_org_id WHERE (r.status='available' AND o.suspended=0) OR r.owner_org_id=? ORDER BY r.status,r.name", (user["id"],)).fetchall()]
-    events = [dict(r) for r in db.execute("SELECT id,kind,title,detail,created_at FROM events WHERE audience_org_id=? ORDER BY created_at DESC LIMIT 20", (user["id"],)).fetchall()]
+    if not user:
+        user = db.execute("SELECT * FROM organizations ORDER BY id LIMIT 1").fetchone()
+    mission_rows = db.execute(
+        "SELECT DISTINCT m.* FROM missions m LEFT JOIN bookings b ON b.mission_id=m.id LEFT JOIN resources br ON br.id=b.resource_id "
+        "WHERE m.requester_org_id=? OR br.owner_org_id=? ORDER BY m.deadline,m.id", (user["id"], user["id"])
+    ).fetchall()
+    missions = [row_to_mission(r, db, False, user["id"]) for r in mission_rows]
+    resource_rows = db.execute(
+        "SELECT r.*,o.short_name AS owner_name FROM resources r JOIN organizations o ON o.id=r.owner_org_id "
+        "WHERE (r.status='available' AND o.suspended=0) OR r.owner_org_id=? ORDER BY r.status,r.name", (user["id"],)
+    ).fetchall()
+    resources = [resource_with_usage(db, r) for r in resource_rows]
+    events = [dict(r) for r in db.execute("SELECT id,kind,title,detail,created_at FROM events WHERE audience_org_id=? ORDER BY created_at DESC LIMIT 30", (user["id"],)).fetchall()]
     organizations = [{"id":r["id"],"name":r["name"],"short_name":r["short_name"],"kind":r["kind"]} for r in db.execute("SELECT * FROM organizations ORDER BY name").fetchall()]
-    return {"organization":dict(user), "organizations":organizations, "missions":missions, "resources":resources, "events":events, "history":get_history(db,user["id"],50), "metrics":get_metrics(db,user["id"]), "version":database_version(db) }
+    return {"organization":dict(user),"organizations":organizations,"missions":missions,"resources":resources,"events":events,"history":get_history(db,user["id"],50),"metrics":get_metrics(db,user["id"]),"version":database_version(db)}
 
 
 def get_metrics(db: sqlite3.Connection, organization_id: int | None = None) -> dict:
@@ -1048,7 +1251,10 @@ def create_mission(db: sqlite3.Connection, body: dict, requester_org_id: int) ->
     if not start or not end or end<=start: raise ValueError("Mission time window is invalid")
     deadline=parse_dt(body.get("deadline") or body.get("cutoff")) or (start-timedelta(hours=24))
     if deadline>=start: deadline=start-timedelta(hours=24)
-    requirements=parse_requirements(body["title"]+" "+body["description"])
+    selected_types = body.get("resource_types") or body.get("resource_type") or []
+    if isinstance(selected_types, str):
+        selected_types = [selected_types]
+    requirements=parse_requirements(body["title"]+" "+body["description"], selected_types)
     plans=build_plans(db,requirements,body["location"],start.isoformat(),end.isoformat(),requester_org_id)
     created=now_iso(); mission_id=insert_id(db,"INSERT INTO missions(requester_org_id,title,description,location,start_at,end_at,deadline,status,requirements,plans,preferences,replacement_pending,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(requester_org_id,body["title"],body["description"],body["location"],start.isoformat(),end.isoformat(),deadline.isoformat(),"open",dumps(requirements),dumps(plans),dumps([p["id"] for p in plans]),0,created,created))
     row=db.execute("SELECT * FROM missions WHERE id=?",(mission_id,)).fetchone()
@@ -1078,12 +1284,20 @@ def overlap(a1,a2,b1,b2):
 def plan_available(db, mission_row, plan, reserved_ids=None):
     reserved_ids=reserved_ids or set(); ids=set()
     for item in plan.get("items",[]):
-        rid=item["resource_id"]
+        rid=int(item["resource_id"])
         if rid in reserved_ids or rid in ids: return False
         res=db.execute("SELECT * FROM resources WHERE id=?",(rid,)).fetchone()
-        if not res or res["status"] != "available" or parse_dt(res["availability_start"])>parse_dt(mission_row["start_at"]) or parse_dt(res["availability_end"])<parse_dt(mission_row["end_at"]): return False
-        used=db.execute("SELECT COALESCE(SUM(quantity),0) FROM bookings WHERE resource_id=? AND status='active' AND start_at<? AND end_at>?",(rid,mission_row["end_at"],mission_row["start_at"])).fetchone()[0]
-        if used+1>float(res["capacity"]): return False
+        mission_start, mission_end = parse_dt(mission_row["start_at"]), parse_dt(mission_row["end_at"])
+        resource_start, resource_end = parse_dt(res["availability_start"]) if res else None, parse_dt(res["availability_end"]) if res else None
+        if not res or res["status"] != "available" or not mission_start or not mission_end or not resource_start or not resource_end or resource_start > mission_start or resource_end < mission_end:
+            return False
+        # Compare parsed timestamps instead of ISO strings; this handles UTC
+        # offsets consistently in SQLite and Supabase.
+        used=0.0
+        for booking in db.execute("SELECT quantity,start_at,end_at FROM bookings WHERE resource_id=? AND status='active'",(rid,)).fetchall():
+            if overlap(booking["start_at"], booking["end_at"], mission_row["start_at"], mission_row["end_at"]):
+                used += float(booking["quantity"] or 0)
+        if used + 1 > float(res["capacity"]): return False
         ids.add(rid)
     return True
 
@@ -1246,7 +1460,10 @@ def admin_run_batch(db):
             waitlisted.append({"mission_id":row["id"],"title":row["title"],"fairness":{"score":round(score,3)}}); record_decision(db,row,fairness,None,"waitlisted",weights,"No preferred plan was feasible after capacity and time-conflict checks."); continue
         reserve_plan(db,row,chosen); db.execute("UPDATE missions SET status='allocated',allocated_plan_id=?,updated_at=? WHERE id=?",(chosen["id"],now_iso(),row["id"]))
         updated=db.execute("SELECT * FROM missions WHERE id=?",(row["id"],)).fetchone()
-        db.execute("UPDATE organizations SET allocations_won=allocations_won+1 WHERE id=?",(row["requester_org_id"],)); add_event(db,"allocation","Mission approved",f"{row['title']} received an approved plan.",row["requester_org_id"]); add_history(db,"mission",row["id"],row["requester_org_id"],"status_allocated",updated); record_decision(db,row,fairness,chosen,"allocated",weights,f"Selected {chosen['id']} as the first feasible plan in the submitted preference order."); allocated.append({"mission_id":row["id"],"title":row["title"],"plan_id":chosen["id"],"fairness":{"score":round(score,3)}})
+        db.execute("UPDATE organizations SET allocations_won=allocations_won+1 WHERE id=?",(row["requester_org_id"],)); add_event(db,"allocation","Mission approved",f"{row['title']} received an approved plan.",row["requester_org_id"])
+        for provider_id in sorted({int(item["owner_org_id"]) for item in chosen.get("items",[]) if item.get("owner_org_id")}):
+            add_event(db,"allocation","Resource lent out",f"{row['title']} was approved and uses resources from your organization.",provider_id)
+        add_history(db,"mission",row["id"],row["requester_org_id"],"status_allocated",updated); record_decision(db,row,fairness,chosen,"allocated",weights,f"Selected {chosen['id']} as the first feasible plan in the submitted preference order."); allocated.append({"mission_id":row["id"],"title":row["title"],"plan_id":chosen["id"],"fairness":{"score":round(score,3)}})
     db.commit(); return {"allocated":allocated,"waitlisted":waitlisted,"processed_at":now_iso(),"message":f"Due batch: {len(allocated)} approved, {len(waitlisted)} waitlisted"}
 
 
@@ -1310,7 +1527,12 @@ def update_config(db, body):
 
 def get_admin_bootstrap(db):
     config=dict(db.execute("SELECT * FROM admin_config WHERE id=1").fetchone()); config["weights"]=loads(config.get("weights"),{})
-    return {"organizations":[dict(r) for r in db.execute("SELECT * FROM organizations ORDER BY name")],"resources":[row_to_resource(r) for r in db.execute("SELECT r.*,o.short_name AS owner_name FROM resources r JOIN organizations o ON o.id=r.owner_org_id ORDER BY r.id")],"missions":[row_to_mission(r,db,True) for r in db.execute("SELECT * FROM missions ORDER BY id")],"events":[dict(r) for r in db.execute("SELECT * FROM events ORDER BY created_at DESC")],"history":get_history(db),"credit_events":[dict(r) for r in db.execute("SELECT * FROM credit_events ORDER BY id DESC LIMIT 200")],"contribution_events":[dict(r) for r in db.execute("SELECT * FROM contribution_events ORDER BY id DESC LIMIT 200")],"decisions":[dict(r) for r in db.execute("SELECT * FROM decisions ORDER BY id DESC")],"bookings":[dict(r) for r in db.execute("SELECT * FROM bookings ORDER BY id")],"config":config,"demo_runs":[dict(r) for r in db.execute("SELECT * FROM demo_runs ORDER BY id DESC")],"disputes":[row_to_dispute(r,db) for r in db.execute("SELECT * FROM disputes ORDER BY id DESC")],"metrics":get_metrics(db),"cloud":{"provider":"Supabase","database_backend":DB_BACKEND,"database_shared":DB_BACKEND == "supabase","evidence_configured":cloud_evidence_enabled(),"evidence_bucket":SUPABASE_EVIDENCE_BUCKET if cloud_evidence_enabled() else None},"version":database_version(db)}
+    demo_runs=[]
+    for row in db.execute("SELECT * FROM demo_runs ORDER BY id DESC"):
+        item=dict(row)
+        item["report"]=dumps(translate_demo_value(loads(item.get("report"),{})))
+        demo_runs.append(item)
+    return {"organizations":[dict(r) for r in db.execute("SELECT * FROM organizations ORDER BY name")],"resources":[row_to_resource(r) for r in db.execute("SELECT r.*,o.short_name AS owner_name FROM resources r JOIN organizations o ON o.id=r.owner_org_id ORDER BY r.id")],"missions":[row_to_mission(r,db,True) for r in db.execute("SELECT * FROM missions ORDER BY id")],"events":[dict(r) for r in db.execute("SELECT * FROM events ORDER BY created_at DESC")],"history":get_history(db),"credit_events":[dict(r) for r in db.execute("SELECT * FROM credit_events ORDER BY id DESC LIMIT 200")],"contribution_events":[dict(r) for r in db.execute("SELECT * FROM contribution_events ORDER BY id DESC LIMIT 200")],"decisions":[dict(r) for r in db.execute("SELECT * FROM decisions ORDER BY id DESC")],"bookings":[dict(r) for r in db.execute("SELECT * FROM bookings ORDER BY id")],"config":config,"demo_runs":demo_runs,"disputes":[row_to_dispute(r,db) for r in db.execute("SELECT * FROM disputes ORDER BY id DESC")],"metrics":get_metrics(db),"cloud":{"provider":"Supabase","database_backend":DB_BACKEND,"database_shared":DB_BACKEND == "supabase","evidence_configured":cloud_evidence_enabled(),"evidence_bucket":SUPABASE_EVIDENCE_BUCKET if cloud_evidence_enabled() else None},"version":database_version(db)}
 
 
 def admin_mission_action(db, mission_id, action, body=None):
@@ -1478,6 +1700,11 @@ def run_demo(db, body=None):
             "assertions": ["Preference order is explainable", "Feasibility is checked before option selection", "The decision snapshot preserves the original preference"],
         },
     }
+    from scripts.demo_visuals import build_frames
+    for key, scenario in scenarios.items():
+        scenario["key"] = key
+        scenario["frames"] = build_frames(key, scenario)
+
     requested = (body or {}).get("scenario", "all")
     selected_key = requested if requested in scenarios else "conflict"
     selected = scenarios[selected_key]

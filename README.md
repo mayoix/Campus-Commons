@@ -15,9 +15,9 @@ The repository includes:
 The user app keeps the wording short and practical:
 
 - The resource directory can be sorted by status, availability time (earliest first), location (A–Z), or price (low to high).
-- Mission submission only asks for the title, need, location, and use time. The server calculates the application deadline.
+- Mission submission lets users select the required resource types (equipment, space, skill, or people), describe the need, choose a location, and set the use interval. The server calculates the application deadline and returns only complete capability matches.
 - The organization profile shows contribution, credit, history, and resources owned by the current organization. Owners can edit their own resource details, availability, and status.
-- Users see the final Mission/resource result. Fairness weights, batch internals, and administrator controls stay in the admin console.
+- Users see the submitted time, cutoff, use interval, and the exact approved resources. Requesters can use their Mission details; resource providers see the Mission and loan period for each resource they supply. Fairness weights, batch internals, and administrator controls stay in the admin console.
 - Recent activity is filtered to the current organization.
 - A user can report a dispute and upload evidence. When an approved compensation dispute is resolved by the affected organization, the provider account is unfrozen.
 
@@ -231,6 +231,20 @@ Sharing the same server Secret key gives every person who receives it backend-le
 5. The user sees the approved Mission/resource/space result, starts use at the scheduled time, and confirms return.
 6. If a provider does not show up or a resource is damaged, the affected organization can submit a dispute and upload evidence.
 
+## v3 visual demo for recording
+
+Open the admin console → **Demo tests**. Select **Run all scenarios** (or one scenario). The new **Demo studio** starts playing automatically:
+
+- Mission cards show Open → Frozen → Ranking → Allocated/Waitlisted.
+- Resource cards show capacity, free slots and the current booking.
+- Animated routes show which request is competing, withdrawn, proposed or booked.
+- Fairness cards show each input × policy weight, its points contribution and the total score.
+- The no-show scenario keeps the alternative unbooked until requester confirmation; the preference scenario visibly skips infeasible P1 and books P2.
+
+Click **Recording view** to fill the screen. Use **Pause**, **Next**, **Back**, **Restart** or a numbered step to narrate; choose 3, 5 or 8 seconds per step. All frames are loaded once. Playback runs locally with CSS animations and pauses admin polling while playing/recording, so individual steps do not wait for cloud round trips. Written reports and scheduler settings are collapsed below the player.
+
+These are deterministic teaching scenarios using the report's policy snapshot, not a replay of live transactions or proof that the allocation engine passed a test. Business records are unchanged; a report is stored in `demo_runs`. Older stored reports need to be rerun once to generate the new visual frames. Real shared-database and evidence-upload behavior still uses the acceptance tests above.
+
 ## Administrator console
 
 The administrator console is an overlay inside the original website; it is not a separate public website. It is hidden from normal users and requires the administrator password.
@@ -312,7 +326,7 @@ Share only the check's PASS/FAIL lines when asking for help. Never share `.env`,
 
 ## Validation status
 
-The launcher and read-only diagnostic have 16 passing automated tests. Launcher readiness, browser-opening timing, child-process cleanup and safe failure paths were tested on Linux, along with real first-time dependency installation and reuse. Windows/macOS launch wrappers have not been run on their native operating systems. Earlier cloud checks in the onboarding environment were blocked by DNS/egress restrictions; no successful live cloud connection or migration from that environment is claimed. Each collaborator must run the preflight on their own network and complete the two-person acceptance test. The owner reports their own local cloud connection works; that does not establish access from other networks.
+The launcher and read-only diagnostic have 17 passing automated tests. Launcher readiness, browser-opening timing, child-process cleanup and safe failure paths were tested on Linux, along with real first-time dependency installation and reuse. Windows/macOS launch wrappers have not been run on their native operating systems. Earlier cloud checks in the onboarding environment were blocked by DNS/egress restrictions; no successful live cloud connection or migration from that environment is claimed. Each collaborator must run the preflight on their own network and complete the two-person acceptance test. The owner reports their own local cloud connection works; that does not establish access from other networks.
 
 ## Implementation decisions
 
