@@ -1,37 +1,38 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <meta name="robots" content="noindex,nofollow" />
-  <title>Campus Commons · 管理端</title>
+  <title>Campus Commons · admin console</title>
   <link rel="stylesheet" href="/static/admin.css" />
 </head>
 <body>
   <div class="admin-shell">
     <header class="admin-topbar">
-      <div class="admin-brand"><span class="admin-mark">C</span><div><b>campus commons</b><small>管理与测试控制台</small></div></div>
-      <div class="admin-top-actions"><span id="admin-session-label" class="session-label">未登录</span><button id="admin-close" class="ghost" type="button" onclick="if(window.closeAdminConsole){window.closeAdminConsole()}else{window.location.href='/' }">返回用户端</button><button id="admin-logout" class="ghost" type="button" hidden>退出管理端</button></div>
+      <div class="admin-brand"><span class="admin-mark">C</span><div><b>campus commons</b><small>Management and testing console</small></div></div>
+      <div class="admin-top-actions"><span id="admin-session-label" class="session-label">Not signed in</span><button id="admin-close" class="ghost" type="button" onclick="if(window.closeAdminConsole){window.closeAdminConsole()}else{window.location.href='/' }">Back to user app</button><button id="admin-logout" class="ghost" type="button" hidden>Log out</button></div>
     </header>
     <main>
       <section id="admin-login" class="login-card">
         <div class="eyebrow">ADMIN CONSOLE</div>
-        <h1>管理端登录</h1>
-        <p>这里用于批次调度、公平分配测试、资源与组织管理及演示 Demo。普通用户端不会显示这些入口。</p>
-        <form id="login-form"><label for="admin-password">管理员密码</label><input id="admin-password" type="password" autocomplete="current-password" required placeholder="输入管理员密码" /><button class="primary" type="submit">进入管理端</button></form>
-        <small class="login-hint">本地演示密码保存在项目根目录 <code>.admin-password</code>；设置 <code>CAMPUS_ADMIN_PASSWORD</code> 后以环境变量为准。</small>
-        <div id="file-warning" class="notice" hidden>当前是本地文件预览，无法连接平台后端。请回到 <a href="http://127.0.0.1:8765/">原网站</a>，再按 Alt + Shift + A 打开管理浮层。</div>
+        <h1>Admin console sign in</h1>
+        <p>Use this console to run allocation batches, test fairness, manage resources and organizations, and run demos. These controls are hidden from regular users.</p>
+        <form id="login-form"><label for="admin-password">Admin password</label><input id="admin-password" type="password" autocomplete="current-password" required placeholder="Enter the admin password" /><button class="primary" type="submit">Open admin console</button></form>
+        <small class="login-hint">The local demo password is stored in the project root <code>.admin-password</code>; set <code>CAMPUS_ADMIN_PASSWORD</code> when deploying; environment variables take precedence.</small>
+        <div id="file-warning" class="notice" hidden>This is a local file preview and cannot reach the platform server. Return to <a href="http://127.0.0.1:8765/">the main site</a>, then press Option (⌥) + Shift + A to open the admin overlay.</div>
         <div id="login-error" class="error" role="alert"></div>
       </section>
       <section id="admin-app" hidden>
         <div class="admin-layout">
-          <aside class="admin-nav" aria-label="管理端导航">
-            <button class="admin-tab active" data-tab="dashboard" type="button">总览</button>
-            <button class="admin-tab" data-tab="missions" type="button">Mission 与分配</button>
-            <button class="admin-tab" data-tab="resources" type="button">资源管理</button>
-            <button class="admin-tab" data-tab="organizations" type="button">组织管理</button>
-            <button class="admin-tab" data-tab="demo" type="button">测试 Demo</button>
-            <button class="admin-tab" data-tab="disputes" type="button">冲突与争议</button>
+          <aside class="admin-nav" aria-label="Admin console navigation">
+            <button class="admin-tab active" data-tab="dashboard" type="button">Overview</button>
+            <button class="admin-tab" data-tab="missions" type="button">Missions and allocation</button>
+            <button class="admin-tab" data-tab="resources" type="button">Resource management</button>
+            <button class="admin-tab" data-tab="organizations" type="button">Organization management</button>
+            <button class="admin-tab" data-tab="demo" type="button">Demo tests</button>
+            <button class="admin-tab" data-tab="disputes" type="button">Conflicts and disputes</button>
+            <button class="admin-tab" data-tab="history" type="button">Persistent history</button>
           </aside>
           <div class="admin-content">
             <div id="admin-toast" class="toast" role="status" aria-live="polite"></div>
@@ -41,12 +42,13 @@
             <section id="tab-organizations" class="admin-tab-panel" hidden></section>
             <section id="tab-demo" class="admin-tab-panel" hidden></section>
             <section id="tab-disputes" class="admin-tab-panel" hidden></section>
+            <section id="tab-history" class="admin-tab-panel" hidden></section>
           </div>
         </div>
       </section>
     </main>
   </div>
-  <script src="/static/admin.js?v=20261003"></script>
+  <script src="/static/admin.js?v=20261003en1"></script>
   <script>if(location.protocol === 'file:'){document.getElementById('file-warning').hidden=false;document.getElementById('login-form').hidden=true;}</script>
 </body>
 </html>

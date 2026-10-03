@@ -3,3 +3,10 @@ campus_commons.sqlite3.bak-*
 .admin-password
 __pycache__/
 .DS_Store
+
+campus_commons.sqlite3-wal
+campus_commons.sqlite3-shm
+.env
+.env.*
+!.env.example
+backups/

@@ -1,54 +1,53 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta name="description" content="Campus Commons 共享资源网络" />
-  <title>Campus Commons · 共享资源网络</title>
+  <meta name="description" content="Campus Commons shared resource network" />
+  <title>Campus Commons · Shared resource network</title>
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
   <div class="app-shell">
-    <aside class="sidebar" aria-label="主导航">
-      <div class="brand"><span class="brand-mark" aria-hidden="true">C</span><div><strong>campus commons</strong><small>香港大学共享资源网络</small></div></div>
-      <button class="workspace-select" id="workspace-profile" type="button" aria-label="打开组织档案">
+    <aside class="sidebar" aria-label="Main navigation">
+      <div class="brand"><span class="brand-mark" aria-hidden="true">C</span><div><strong>campus commons</strong><small>HKU shared resource network</small></div></div>
+      <button class="workspace-select" id="workspace-profile" type="button" aria-label="Open organization profile">
         <span class="avatar" id="org-avatar">—</span>
-        <div><span id="org-name">载入中…</span><small>组织档案 · 我的资源</small></div>
+        <div><span id="org-name">Loading…</span><small>Organization profile · My resources</small></div>
         <span class="chevron" aria-hidden="true">⌄</span>
       </button>
-      <nav class="nav" aria-label="主导航">
-        <button class="nav-item active" data-view="overview" type="button"><span aria-hidden="true">◒</span>总览</button>
+      <nav class="nav" aria-label="Main navigation">
+        <button class="nav-item active" data-view="overview" type="button"><span aria-hidden="true">◒</span>Overview</button>
         <button class="nav-item" data-view="missions" type="button"><span aria-hidden="true">◎</span>Mission</button>
-        <button class="nav-item" data-view="resources" type="button"><span aria-hidden="true">▦</span>资源池</button>
-        <button class="nav-item" data-view="profile" type="button"><span aria-hidden="true">◌</span>组织档案</button>
+        <button class="nav-item" data-view="resources" type="button"><span aria-hidden="true">▦</span>Resources</button>
+        <button class="nav-item" data-view="profile" type="button"><span aria-hidden="true">◌</span>Organization profile</button>
       </nav>
       <div class="sidebar-section">
-        <div class="sidebar-label">快速入口 <button class="plus" id="open-resource" type="button" aria-label="开放新资源">+</button></div>
-        <button class="mini-link" data-view="missions" type="button"><span class="dot green" aria-hidden="true"></span>提交新 Mission</button>
-        <button class="mini-link" data-view="resources" type="button"><span class="dot blue" aria-hidden="true"></span>浏览资源池</button>
+        <div class="sidebar-label">Quick actions <button class="plus" id="open-resource" type="button" aria-label="Publish a new resource">+</button></div>
+        <button class="mini-link" data-view="missions" type="button"><span class="dot green" aria-hidden="true"></span>Submit a Mission</button>
+        <button class="mini-link" data-view="resources" type="button"><span class="dot blue" aria-hidden="true"></span>Browse resources</button>
       </div>
       <div class="sidebar-bottom">
-        <div class="help-card"><div class="help-icon" aria-hidden="true">?</div><div><strong>需要帮助？</strong><small>查看资源与 Mission 指南</small></div></div>
-        <div class="profile-row"><span class="avatar light" aria-hidden="true">CC</span><div><strong>组织成员</strong><small>本地演示组织会话</small></div></div>
+        <button class="help-card" id="help-guide" type="button"><div class="help-icon" aria-hidden="true">?</div><div><strong>Need help?</strong><small>Resource and Mission guide</small></div><span aria-hidden="true">›</span></button>
       </div>
     </aside>
     <main class="main">
       <header class="topbar">
-        <div class="crumbs"><span>共享资源网络</span><b aria-hidden="true">/</b><strong id="page-label">总览</strong></div>
+        <div class="crumbs"><span>Shared resource network</span><b aria-hidden="true">/</b><strong id="page-label">Overview</strong></div>
         <div class="top-actions">
-          <button class="icon-btn" id="global-search" type="button" title="搜索资源或我的 Mission" aria-label="搜索资源或我的 Mission">⌕</button>
-          <button class="icon-btn" id="activity-toggle" type="button" title="与本组织相关的最近活动" aria-label="与本组织相关的最近活动">♢<i aria-hidden="true"></i></button>
-          <button class="outline-btn" id="switch-org" type="button">切换组织 <span aria-hidden="true">⌄</span></button>
+          <button class="icon-btn" id="global-search" type="button" title="Search resources or my Missions" aria-label="Search resources or my Missions">⌕</button>
+          <button class="icon-btn" id="activity-toggle" type="button" title="Recent activity for this organization" aria-label="Recent activity for this organization">♢<i aria-hidden="true"></i></button>
+          <button class="outline-btn" id="switch-org" type="button">Switch organization <span aria-hidden="true">⌄</span></button>
         </div>
       </header>
       <div id="toast" class="toast" role="status" aria-live="polite"></div>
-      <section id="view-overview" class="view active" aria-label="总览"></section>
+      <section id="view-overview" class="view active" aria-label="Overview"></section>
       <section id="view-missions" class="view" aria-label="Mission"></section>
-      <section id="view-resources" class="view" aria-label="资源池"></section>
-      <section id="view-profile" class="view" aria-label="组织档案"></section>
+      <section id="view-resources" class="view" aria-label="Resources"></section>
+      <section id="view-profile" class="view" aria-label="Organization profile"></section>
     </main>
   </div>
   <div class="modal-backdrop" id="modal-backdrop" aria-hidden="true"><div class="modal" id="modal" role="dialog" aria-modal="true"></div></div>
-  <script src="/static/app.js?v=20261003b"></script>
+  <script src="/static/app.js?v=20261003en1"></script>
 </body>
 </html>

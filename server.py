@@ -17,21 +17,71 @@ import threading
 import secrets
 import hashlib
 import shutil
+import base64
+import binascii
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except ImportError:  # Cloud mode reports a helpful setup error when selected.
+    psycopg = None
+    dict_row = None
+
 
 ROOT = Path(__file__).resolve().parent
-DB_PATH = ROOT / "campus_commons.sqlite3"
+DB_PATH = Path(os.environ.get("CAMPUS_DB_PATH", str(ROOT / "campus_commons.sqlite3"))).expanduser()
 STATIC_DIR = ROOT / "static"
 UTC = timezone.utc
 DB_LOCK = threading.RLock()
 USER_SESSIONS: dict[str, int] = {}
 ADMIN_SESSIONS: set[str] = set()
 ADMIN_PASSWORD_PATH = ROOT / ".admin-password"
+
+
+def load_local_env() -> None:
+    """Load a tiny, dependency-free .env file for local setup.
+
+    Explicit shell environment variables always win. Keeping this here avoids
+    requiring python-dotenv for a hackathon checkout while still making the
+    Supabase setup copy/paste friendly.
+    """
+    env_path = ROOT / ".env"
+    if not env_path.exists():
+        return
+    try:
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+load_local_env()
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY") or os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+SUPABASE_EVIDENCE_BUCKET = os.environ.get("SUPABASE_EVIDENCE_BUCKET", "campus-evidence")
+SUPABASE_DATABASE_URL = os.environ.get("SUPABASE_DATABASE_URL", "").strip()
+# Once the cloud DSN is configured, business data uses the shared Postgres
+# database. Set CAMPUS_DB_BACKEND=sqlite only for an intentional local rollback.
+DB_BACKEND = os.environ.get("CAMPUS_DB_BACKEND", "supabase" if SUPABASE_DATABASE_URL else "sqlite").lower()
 
 
 def now_iso() -> str:
@@ -58,10 +108,90 @@ def loads(value, default):
         return default
 
 
+class CloudCursor:
+    """Small psycopg adapter for the existing SQLite-shaped query code."""
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    @staticmethod
+    def _translate(statement: str) -> str:
+        # The MVP uses SQLite's positional ? placeholders. Translate only
+        # question marks outside SQL string literals for psycopg.
+        out, quoted = [], False
+        for char in statement:
+            if char == "'":
+                quoted = not quoted
+            out.append("%s" if char == "?" and not quoted else char)
+        return "".join(out)
+
+    def execute(self, statement, params=None):
+        self._cursor.execute(self._translate(statement), params or ())
+        return self
+
+    def fetchone(self):
+        row = self._cursor.fetchone()
+        return CompatRow(row) if row is not None else None
+
+    def fetchall(self):
+        return [CompatRow(row) for row in self._cursor.fetchall()]
+
+    def __iter__(self):
+        return (CompatRow(row) for row in self._cursor)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._cursor.close()
+
+
+class CompatRow(dict):
+    """A dict row that also supports SQLite-style numeric indexing."""
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return list(self.values())[key]
+        return super().__getitem__(key)
+
+
+class CloudConnection:
+    def __init__(self, dsn: str):
+        if psycopg is None:
+            raise RuntimeError("Supabase is configured, but psycopg is not installed. Run: python3 -m pip install 'psycopg[binary]'")
+        self._conn = psycopg.connect(dsn, connect_timeout=15, row_factory=dict_row)
+
+    def execute(self, statement, params=None):
+        return CloudCursor(self._conn.execute(CloudCursor._translate(statement), params or ()))
+
+    def cursor(self):
+        return CloudCursor(self._conn.cursor())
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+    def close(self):
+        self._conn.close()
+
+    def __enter__(self):
+        self._conn.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return self._conn.__exit__(exc_type, exc, tb)
+
+
 def connect() -> sqlite3.Connection:
+    if DB_BACKEND == "supabase":
+        if not SUPABASE_DATABASE_URL:
+            raise RuntimeError("CAMPUS_DB_BACKEND=supabase is set, but SUPABASE_DATABASE_URL is missing. Check your .env file.")
+        return CloudConnection(SUPABASE_DATABASE_URL)  # type: ignore[return-value]
     db = sqlite3.connect(DB_PATH, check_same_thread=False)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys = ON")
+    db.execute("PRAGMA busy_timeout = 5000")
+    db.execute("PRAGMA journal_mode = WAL")
     return db
 
 
@@ -93,6 +223,8 @@ CREATE TABLE IF NOT EXISTS resources (
   capacity REAL NOT NULL DEFAULT 1,
   condition TEXT NOT NULL DEFAULT 'Good',
   hourly_value REAL NOT NULL DEFAULT 0,
+  external_hourly_cost REAL NOT NULL DEFAULT 0,
+  cost_source TEXT NOT NULL DEFAULT '',
   verified INTEGER NOT NULL DEFAULT 1,
   status TEXT NOT NULL DEFAULT 'available',
   created_at TEXT NOT NULL
@@ -131,6 +263,7 @@ CREATE TABLE IF NOT EXISTS bookings (
   end_at TEXT NOT NULL,
   quantity REAL NOT NULL DEFAULT 1,
   status TEXT NOT NULL DEFAULT 'active',
+  completed_at TEXT,
   created_at TEXT NOT NULL,
   UNIQUE(mission_id, resource_id)
 );
@@ -141,25 +274,99 @@ CREATE TABLE IF NOT EXISTS demo_runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT, started_at TEXT NOT NULL, finished_at TEXT NOT NULL, status TEXT NOT NULL, report TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS decisions (
-  id INTEGER PRIMARY KEY AUTOINCREMENT, mission_id INTEGER, fairness_score REAL, chosen_plan TEXT, outcome TEXT, created_at TEXT NOT NULL
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  mission_id INTEGER,
+  urgency REAL,
+  contribution REAL,
+  credit REAL,
+  access_fairness REAL,
+  alternative_scarcity REAL,
+  fairness_score REAL,
+  submitted_preferences TEXT NOT NULL DEFAULT '[]',
+  chosen_plan TEXT,
+  outcome TEXT,
+  explanation TEXT NOT NULL DEFAULT '',
+  policy_snapshot TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS disputes (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   mission_id INTEGER NOT NULL REFERENCES missions(id),
   reporter_org_id INTEGER NOT NULL REFERENCES organizations(id),
+  accused_org_id INTEGER REFERENCES organizations(id),
   category TEXT NOT NULL,
   description TEXT NOT NULL,
+  compensation_amount REAL NOT NULL DEFAULT 0,
+  evidence TEXT NOT NULL DEFAULT '[]',
+  compensation_status TEXT NOT NULL DEFAULT 'not_requested',
   status TEXT NOT NULL DEFAULT 'open',
   created_at TEXT NOT NULL,
-  resolved_at TEXT, resolved_by TEXT, resolution_description TEXT
+  resolved_at TEXT, resolved_by TEXT, resolution_description TEXT,
+  approved_at TEXT, frozen_at TEXT, victim_resolved_at TEXT
+);
+CREATE TABLE IF NOT EXISTS credit_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  organization_id INTEGER NOT NULL REFERENCES organizations(id),
+  event_type TEXT NOT NULL,
+  delta REAL NOT NULL,
+  before_score REAL NOT NULL,
+  after_score REAL NOT NULL,
+  mission_id INTEGER REFERENCES missions(id),
+  details TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS contribution_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  organization_id INTEGER NOT NULL REFERENCES organizations(id),
+  event_type TEXT NOT NULL,
+  hours REAL NOT NULL,
+  resource_id INTEGER REFERENCES resources(id),
+  mission_id INTEGER REFERENCES missions(id),
+  details TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS history_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  entity_type TEXT NOT NULL,
+  entity_id INTEGER NOT NULL,
+  organization_id INTEGER REFERENCES organizations(id),
+  action TEXT NOT NULL,
+  snapshot TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_history_org_time ON history_log(organization_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_history_entity_time ON history_log(entity_type, entity_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS user_sessions (
+  session_id TEXT PRIMARY KEY,
+  organization_id INTEGER NOT NULL REFERENCES organizations(id),
+  created_at TEXT NOT NULL,
+  last_seen TEXT NOT NULL
 );
 """
 
 
 def init_db() -> None:
-    # Existing MVP data is preserved. A timestamped copy is made by the caller
-    # before this migration; only additive columns/tables are created here.
+    if DB_BACKEND == "supabase":
+        # Keep the schema source shared with the one-shot migration utility.
+        from scripts.migrate_sqlite_to_supabase import DDL as POSTGRES_DDL
+        with DB_LOCK, connect() as db:
+            for statement in POSTGRES_DDL:
+                db.execute(statement)
+            db.execute("INSERT INTO admin_config(id,weights) VALUES(1,?) ON CONFLICT (id) DO NOTHING", (dumps({"urgency":.3,"contribution":.2,"credit":.15,"access_fairness":.2,"alternative_scarcity":.15}),))
+            if db.execute("SELECT COUNT(*) AS count FROM organizations").fetchone()["count"] == 0:
+                seed_db(db)
+            for m in db.execute("SELECT * FROM missions WHERE status IN ('allocated','in_use','completed') AND allocated_plan_id IS NOT NULL").fetchall():
+                for item in next((p for p in loads(m["plans"],[]) if p.get("id")==m["allocated_plan_id"]),{}).get("items",[]):
+                    db.execute("INSERT INTO bookings(mission_id,resource_id,start_at,end_at,quantity,status,created_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT (mission_id,resource_id) DO NOTHING", (m["id"],item["resource_id"],m["start_at"],m["end_at"],1,"active",m["created_at"]))
+            db.execute("UPDATE resources SET external_hourly_cost=hourly_value WHERE external_hourly_cost=0")
+            backfill_history(db)
+            backfill_decisions(db)
+            db.commit()
+        return
+    # Existing data is preserved. This migration only adds missing schema and
+    # backfills one initial history entry for records created before history_log.
     with DB_LOCK, connect() as db:
+        db.execute("PRAGMA busy_timeout=5000")
         db.executescript(SCHEMA)
         def add_column(table, column, definition):
             cols = {r[1] for r in db.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -172,6 +379,24 @@ def init_db() -> None:
         add_column("disputes", "resolved_at", "TEXT")
         add_column("disputes", "resolved_by", "TEXT")
         add_column("disputes", "resolution_description", "TEXT")
+        add_column("disputes", "accused_org_id", "INTEGER")
+        add_column("disputes", "compensation_amount", "REAL NOT NULL DEFAULT 0")
+        add_column("disputes", "evidence", "TEXT NOT NULL DEFAULT '[]'")
+        add_column("disputes", "compensation_status", "TEXT NOT NULL DEFAULT 'not_requested'")
+        add_column("disputes", "approved_at", "TEXT")
+        add_column("disputes", "frozen_at", "TEXT")
+        add_column("disputes", "victim_resolved_at", "TEXT")
+        add_column("resources", "external_hourly_cost", "REAL NOT NULL DEFAULT 0")
+        add_column("resources", "cost_source", "TEXT NOT NULL DEFAULT ''")
+        add_column("bookings", "completed_at", "TEXT")
+        add_column("decisions", "urgency", "REAL")
+        add_column("decisions", "contribution", "REAL")
+        add_column("decisions", "credit", "REAL")
+        add_column("decisions", "access_fairness", "REAL")
+        add_column("decisions", "alternative_scarcity", "REAL")
+        add_column("decisions", "submitted_preferences", "TEXT NOT NULL DEFAULT '[]'")
+        add_column("decisions", "explanation", "TEXT NOT NULL DEFAULT ''")
+        add_column("decisions", "policy_snapshot", "TEXT NOT NULL DEFAULT '{}'")
         db.execute("INSERT OR IGNORE INTO admin_config(id,weights) VALUES(1,?)", (dumps({"urgency":.3,"contribution":.2,"credit":.15,"access_fairness":.2,"alternative_scarcity":.15}),))
         if db.execute("SELECT COUNT(*) FROM organizations").fetchone()[0] == 0:
             seed_db(db)
@@ -179,9 +404,20 @@ def init_db() -> None:
         for m in db.execute("SELECT * FROM missions WHERE status IN ('allocated','in_use','completed') AND allocated_plan_id IS NOT NULL").fetchall():
             for item in next((p for p in loads(m["plans"],[]) if p.get("id")==m["allocated_plan_id"]),{}).get("items",[]):
                 db.execute("INSERT OR IGNORE INTO bookings(mission_id,resource_id,start_at,end_at,quantity,status,created_at) VALUES(?,?,?,?,?,?,?)",(m["id"],item["resource_id"],m["start_at"],m["end_at"],1,"active",m["created_at"]))
-        # Reservation is represented by bookings; resource status stays lifecycle-only.
-        db.execute("UPDATE resources SET status='available' WHERE status='reserved'")
+        # Reservation is represented by bookings; resource status is not reset
+        # during startup, so a restart cannot overwrite a provider's status.
+        db.execute("UPDATE resources SET external_hourly_cost=hourly_value WHERE external_hourly_cost=0")
+        backfill_history(db)
+        backfill_decisions(db)
         db.commit()
+
+
+def insert_id(db, statement: str, params: tuple) -> int:
+    """Insert a row and return its id on either SQLite or Postgres."""
+    if DB_BACKEND == "supabase":
+        row = db.execute(statement + " RETURNING id", params).fetchone()
+        return int(row["id"] if isinstance(row, dict) else row[0])
+    return int(db.execute(statement, params).lastrowid)
 
 def admin_password() -> str:
     configured = os.environ.get("CAMPUS_ADMIN_PASSWORD")
@@ -196,6 +432,20 @@ def admin_password() -> str:
     return value
 
 
+def backup_db() -> None:
+    """Keep a timestamped local rollback copy before any schema migration."""
+    if not DB_PATH.exists():
+        return
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    target = DB_PATH.with_name(f"{DB_PATH.name}.bak-{stamp}")
+    try:
+        shutil.copy2(DB_PATH, target)
+    except OSError:
+        # A read-only or externally managed deployment can still start; the
+        # database itself remains the source of truth.
+        pass
+
+
 def seed_db(db: sqlite3.Connection) -> None:
     created = now_iso()
     orgs = [
@@ -207,11 +457,9 @@ def seed_db(db: sqlite3.Connection) -> None:
     ]
     org_ids = []
     for org in orgs:
-        cur = db.execute(
+        org_ids.append(insert_id(db,
             "INSERT INTO organizations(name,short_name,kind,credit_score,shared_hours,available_hours,allocations_won,allocations_lost,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-            (*org, created),
-        )
-        org_ids.append(cur.lastrowid)
+            (*org, created)))
 
     base = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
     def time_at(hours: int) -> str:
@@ -239,16 +487,13 @@ def seed_db(db: sqlite3.Connection) -> None:
     def add_mission(requester, title, desc, location, start, end, deadline, status="open", prefs=None):
         requirements = parse_requirements(title + " " + desc)
         plans = build_plans(db, requirements, location, time_at(start), time_at(end), requester)
-        cur = db.execute(
+        mission_id = insert_id(db,
             "INSERT INTO missions(requester_org_id,title,description,location,start_at,end_at,deadline,status,requirements,plans,preferences,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (requester, title, desc, location, time_at(start), time_at(end), time_at(deadline), status, dumps(requirements), dumps(plans), dumps(prefs or [p["id"] for p in plans]), created, created),
-        )
+            (requester, title, desc, location, time_at(start), time_at(end), time_at(deadline), status, dumps(requirements), dumps(plans), dumps(prefs or [p["id"] for p in plans]), created, created))
         if status == "allocated" and plans:
             preferred = (prefs or [plans[0]["id"]])[0]
             chosen = next((p for p in plans if p["id"] == preferred), plans[0])
-            db.execute("UPDATE missions SET allocated_plan_id=? WHERE id=?", (chosen["id"], cur.lastrowid))
-            for item in chosen["items"]:
-                db.execute("UPDATE resources SET status='reserved' WHERE id=?", (item["resource_id"],))
+            db.execute("UPDATE missions SET allocated_plan_id=? WHERE id=?", (chosen["id"], mission_id))
 
     add_mission(org_ids[4], "Prototype demo day", "Need a camera and lighting for a student product demo, plus a small studio space.", "Main Building", 72, 80, 48)
     add_mission(org_ids[0], "Robotics outreach workshop", "Eight volunteers and a workshop space for an Arduino robotics workshop.", "Main Building", 30, 38, 6, "allocated", ["plan-1"])
@@ -261,6 +506,111 @@ def seed_db(db: sqlite3.Connection) -> None:
 
 def add_event(db: sqlite3.Connection, kind: str, title: str, detail: str, audience_org_id: int | None = None) -> None:
     db.execute("INSERT INTO events(kind,title,detail,created_at,audience_org_id) VALUES(?,?,?,?,?)", (kind, title, detail, now_iso(), audience_org_id))
+
+
+def row_snapshot(row: sqlite3.Row | dict | None) -> dict:
+    if row is None:
+        return {}
+    return dict(row)
+
+
+def add_history(db: sqlite3.Connection, entity_type: str, entity_id: int, organization_id: int | None, action: str, snapshot: sqlite3.Row | dict | None = None) -> None:
+    """Append an immutable record of a business change to the persistent log."""
+    db.execute(
+        "INSERT INTO history_log(entity_type,entity_id,organization_id,action,snapshot,created_at) VALUES(?,?,?,?,?,?)",
+        (entity_type, int(entity_id), organization_id, action, dumps(row_snapshot(snapshot)), now_iso()),
+    )
+
+
+def backfill_history(db: sqlite3.Connection) -> None:
+    """Give records from the original MVP a first history entry exactly once."""
+    for table, entity_type, org_column in (("resources", "resource", "owner_org_id"), ("missions", "mission", "requester_org_id")):
+        rows = db.execute(f"SELECT * FROM {table} ORDER BY id").fetchall()
+        for row in rows:
+            exists = db.execute(
+                "SELECT 1 FROM history_log WHERE entity_type=? AND entity_id=? LIMIT 1",
+                (entity_type, row["id"]),
+            ).fetchone()
+            if not exists:
+                add_history(db, entity_type, row["id"], row[org_column], "created", row)
+
+
+def get_history(db: sqlite3.Connection, organization_id: int | None = None, limit: int = 200) -> list[dict]:
+    if organization_id is None:
+        rows = db.execute("SELECT * FROM history_log ORDER BY created_at DESC, id DESC LIMIT ?", (limit,)).fetchall()
+    else:
+        rows = db.execute(
+            "SELECT * FROM history_log WHERE organization_id=? ORDER BY created_at DESC, id DESC LIMIT ?",
+            (organization_id, limit),
+        ).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["snapshot"] = loads(item.get("snapshot"), {})
+        result.append(item)
+    return result
+
+
+def database_version(db: sqlite3.Connection) -> str:
+    """Return a cheap change token shared by the user and admin clients."""
+    parts = []
+    for table in ("history_log", "events", "decisions", "demo_runs", "disputes", "resources", "missions"):
+        row = db.execute(f"SELECT COUNT(*) AS count, COALESCE(MAX(id),0) AS max_id FROM {table}").fetchone()
+        parts.append(f"{table}:{row['count']}:{row['max_id']}")
+    return "|".join(parts)
+
+
+def record_decision(db: sqlite3.Connection, mission: sqlite3.Row, fairness: dict, chosen_plan: dict | None, outcome: str, weights: dict, explanation: str) -> None:
+    db.execute(
+        "INSERT INTO decisions(mission_id,urgency,contribution,credit,access_fairness,alternative_scarcity,fairness_score,submitted_preferences,chosen_plan,outcome,explanation,policy_snapshot,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            mission["id"], fairness.get("urgency"), fairness.get("contribution"), fairness.get("credit"),
+            fairness.get("access_fairness"), fairness.get("alternative_scarcity"), fairness.get("score"),
+            dumps(loads(mission["preferences"], [])), chosen_plan.get("id") if chosen_plan else None,
+            outcome, explanation, dumps(weights), now_iso(),
+        ),
+    )
+
+
+def backfill_decisions(db: sqlite3.Connection) -> None:
+    """Capture the original allocated sample as an explainable decision."""
+    cfg = db.execute("SELECT weights FROM admin_config WHERE id=1").fetchone()
+    weights = loads(cfg["weights"], {}) if cfg else {}
+    for mission in db.execute("SELECT * FROM missions WHERE status IN ('allocated','in_use','completed') AND allocated_plan_id IS NOT NULL ORDER BY id").fetchall():
+        if db.execute("SELECT 1 FROM decisions WHERE mission_id=? LIMIT 1", (mission["id"],)).fetchone():
+            continue
+        org = db.execute("SELECT * FROM organizations WHERE id=?", (mission["requester_org_id"],)).fetchone()
+        if not org:
+            continue
+        fairness = org_fairness(org, mission, len(loads(mission["plans"], [])), weights)
+        plan = next((p for p in loads(mission["plans"], []) if p.get("id") == mission["allocated_plan_id"]), None)
+        record_decision(db, mission, fairness, plan, "seeded", weights, "Historical demo allocation preserved during database migration.")
+
+
+def record_credit_event(db: sqlite3.Connection, organization_id: int, event_type: str, delta: float, mission_id: int | None = None, details: str = "") -> float:
+    row = db.execute("SELECT credit_score FROM organizations WHERE id=?", (organization_id,)).fetchone()
+    if not row:
+        return 0.0
+    before = float(row["credit_score"])
+    after = max(0.0, min(100.0, before + float(delta)))
+    db.execute("UPDATE organizations SET credit_score=? WHERE id=?", (after, organization_id))
+    db.execute("INSERT INTO credit_events(organization_id,event_type,delta,before_score,after_score,mission_id,details,created_at) VALUES(?,?,?,?,?,?,?,?)", (organization_id, event_type, float(delta), before, after, mission_id, details, now_iso()))
+    return after
+
+
+def record_contribution_event(db: sqlite3.Connection, organization_id: int, event_type: str, hours: float, resource_id: int | None = None, mission_id: int | None = None, details: str = "") -> None:
+    value = float(hours)
+    if abs(value) < 0.0001:
+        return
+    db.execute("INSERT INTO contribution_events(organization_id,event_type,hours,resource_id,mission_id,details,created_at) VALUES(?,?,?,?,?,?,?)", (organization_id, event_type, value, resource_id, mission_id, details, now_iso()))
+    field = "shared_hours" if event_type == "ACTUAL_SHARE" else "available_hours"
+    floor_fn = "GREATEST" if DB_BACKEND == "supabase" else "MAX"
+    db.execute(f"UPDATE organizations SET {field}={floor_fn}(0,{field}+?) WHERE id=?", (value, organization_id))
+
+
+def window_hours(start: str | None, end: str | None) -> float:
+    a, b = parse_dt(start), parse_dt(end)
+    return max(0.0, (b - a).total_seconds() / 3600) if a and b and b > a else 0.0
 
 
 KEYWORD_REQUIREMENTS = [
@@ -329,7 +679,7 @@ def build_plans(db: sqlite3.Connection, requirements: list[dict], location: str,
         for (req, _), (score, resource) in zip(choices, combo):
             items.append({
                 "requirement": req["label"], "requirement_key": req["key"], "resource_id": resource["id"],
-                "resource": resource["name"], "type": resource["type"], "owner": resource["owner_name"],
+                "resource": resource["name"], "type": resource["type"], "owner": resource["owner_name"], "owner_org_id": resource["owner_org_id"],
                 "location": resource["location"], "score": round(score, 3), "hourly_value": resource["hourly_value"],
             })
             scores.append(score)
@@ -356,7 +706,9 @@ def org_fairness(org: sqlite3.Row, mission: sqlite3.Row, plan_count: int, weight
     access = 0.9 if total_allocations == 0 else max(0.0, min(1.0, 1 - org["allocations_won"]/max(total_allocations, 3)))
     scarcity = max(0.0, min(1.0, 1 - max(plan_count-1, 0)/4))
     weights = weights or {"urgency":.3,"contribution":.2,"credit":.15,"access_fairness":.2,"alternative_scarcity":.15}
-    score = 0 if org["credit_score"] <= 70 else (weights.get("urgency",.3)*urgency + weights.get("contribution",.2)*contribution + weights.get("credit",.15)*credit + weights.get("access_fairness",.2)*access + weights.get("alternative_scarcity",.15)*scarcity)
+    # Credit remains a continuous fairness input. Eligibility is controlled by
+    # the explicit suspended flag, so a score below 70 is not an automatic cliff.
+    score = weights.get("urgency",.3)*urgency + weights.get("contribution",.2)*contribution + weights.get("credit",.15)*credit + weights.get("access_fairness",.2)*access + weights.get("alternative_scarcity",.15)*scarcity
     return {"score": round(score, 3), "urgency": round(urgency, 3), "contribution": round(contribution, 3), "credit": round(credit, 3), "access_fairness": round(access, 3), "alternative_scarcity": round(scarcity, 3)}
 
 
@@ -370,6 +722,19 @@ def row_to_resource(row: sqlite3.Row) -> dict:
     return item
 
 
+def row_to_dispute(row: sqlite3.Row, db: sqlite3.Connection, include_evidence: bool = True) -> dict:
+    item = dict(row)
+    item["evidence"] = loads(item.get("evidence", "[]"), []) if include_evidence else []
+    for index, evidence in enumerate(item["evidence"]):
+        if evidence.get("storage") == "supabase" and evidence.get("path"):
+            evidence["endpoint"] = f"/api/admin/disputes/{item['id']}/evidence/{index}"
+    reporter = db.execute("SELECT id, name, short_name FROM organizations WHERE id=?", (item.get("reporter_org_id"),)).fetchone()
+    accused = db.execute("SELECT id, name, short_name, credit_score, suspended FROM organizations WHERE id=?", (item.get("accused_org_id"),)).fetchone() if item.get("accused_org_id") else None
+    item["reporter"] = dict(reporter) if reporter else None
+    item["accused"] = dict(accused) if accused else None
+    return item
+
+
 def row_to_mission(row: sqlite3.Row, db: sqlite3.Connection, detail: bool = False) -> dict:
     item = dict(row)
     item["requirements"] = loads(item.pop("requirements", "[]"), [])
@@ -380,6 +745,10 @@ def row_to_mission(row: sqlite3.Row, db: sqlite3.Connection, detail: bool = Fals
     # Keep weighting policy server-side; the client only receives the total.
     full_fairness = org_fairness(org, row, len(item["plans"])) if org else None
     item["fairness"] = {"score": full_fairness["score"]} if full_fairness else None
+    # Detailed Mission views include the reporter's dispute state, so the
+    # affected organization can acknowledge resolution from the user client.
+    if detail:
+        item["disputes"] = [row_to_dispute(dispute, db, include_evidence=True) for dispute in db.execute("SELECT * FROM disputes WHERE mission_id=? ORDER BY id DESC", (item["id"],)).fetchall()]
     if not detail:
         item["description"] = item["description"][:140]
     return item
@@ -432,6 +801,15 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
+    def send_binary(self, payload: bytes, content_type: str, filename: str = "evidence"):
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Content-Disposition", f"inline; filename*=UTF-8''{urllib.parse.quote(filename)}")
+        self.send_header("Cache-Control", "private, max-age=60")
+        self.end_headers()
+        self.wfile.write(payload)
+
     def send_file(self, path: Path):
         if not path.exists():
             self.send_error(HTTPStatus.NOT_FOUND); return
@@ -445,12 +823,22 @@ class Handler(BaseHTTPRequestHandler):
     def user_org(self, db: sqlite3.Connection) -> sqlite3.Row:
         token = cookie_value(self, "user_sid")
         org_id = USER_SESSIONS.get(token or "")
+        if not org_id and token:
+            saved = db.execute("SELECT organization_id FROM user_sessions WHERE session_id=?", (token,)).fetchone()
+            org_id = saved["organization_id"] if saved else None
+            if org_id:
+                USER_SESSIONS[token] = org_id
         row = db.execute("SELECT * FROM organizations WHERE id=?", (org_id or 1,)).fetchone()
         if not row:
             row = db.execute("SELECT * FROM organizations ORDER BY id LIMIT 1").fetchone()
         if not token or token not in USER_SESSIONS:
             token = secrets.token_urlsafe(24); USER_SESSIONS[token] = row["id"]
+            session_sql = ("INSERT INTO user_sessions(session_id,organization_id,created_at,last_seen) VALUES(?,?,?,?) ON CONFLICT (session_id) DO UPDATE SET organization_id=EXCLUDED.organization_id, created_at=EXCLUDED.created_at, last_seen=EXCLUDED.last_seen" if DB_BACKEND == "supabase" else "INSERT OR REPLACE INTO user_sessions(session_id,organization_id,created_at,last_seen) VALUES(?,?,?,?)")
+            db.execute(session_sql, (token, row["id"], now_iso(), now_iso()))
             self._cookies = getattr(self, "_cookies", []) + [f"user_sid={token}; HttpOnly; SameSite=Strict; Path=/"]
+        elif org_id:
+            db.execute("UPDATE user_sessions SET last_seen=? WHERE session_id=?", (now_iso(), token))
+        db.commit()
         return row
 
     def admin_ok(self) -> bool:
@@ -490,6 +878,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"mission":row_to_mission(row,db,True)}); return
             if path == "/api/metrics":
                 org=self.user_org(db); self.send_json({"metrics":get_metrics(db,org["id"])}); return
+            if path == "/api/history":
+                org=self.user_org(db); self.send_json({"history":get_history(db,org["id"])}); return
             if path == "/api/profile":
                 org=self.user_org(db); own=[row_to_resource(r) for r in db.execute("SELECT r.*,o.short_name AS owner_name FROM resources r JOIN organizations o ON o.id=r.owner_org_id WHERE r.owner_org_id=? ORDER BY r.status,r.name",(org["id"],)).fetchall()]; self.send_json({"organization":dict(org),"resources":own,"metrics":get_metrics(db,org["id"]) }); return
             if path == "/api/admin/bootstrap":
@@ -497,6 +887,24 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(get_admin_bootstrap(db)); return
             if path == "/api/admin/password-status":
                 self.send_json({"configured": bool(os.environ.get("CAMPUS_ADMIN_PASSWORD") or ADMIN_PASSWORD_PATH.exists())}); return
+            match = re.fullmatch(r"/api/admin/disputes/(\d+)/evidence/(\d+)", path)
+            if match:
+                if not self.admin_ok(): self.send_json({"error":"Admin authentication required"},401); return
+                dispute = db.execute("SELECT * FROM disputes WHERE id=?", (int(match.group(1)),)).fetchone()
+                if not dispute: self.send_json({"error":"Dispute not found"},404); return
+                evidence = loads(dispute["evidence"], [])
+                index = int(match.group(2))
+                if index < 0 or index >= len(evidence): self.send_json({"error":"Evidence not found"},404); return
+                item = evidence[index]
+                try:
+                    if item.get("storage") == "supabase": payload, content_type = load_cloud_evidence(item.get("path", ""))
+                    else:
+                        source = item.get("data", "")
+                        header, encoded = source.split(",", 1)
+                        payload = base64.b64decode(encoded, validate=True); content_type = header[5:].split(";", 1)[0] or item.get("type", "application/octet-stream")
+                    self.send_binary(payload, content_type, item.get("name", "evidence")); return
+                except (ValueError, OSError, urllib.error.URLError, urllib.error.HTTPError, binascii.Error) as exc:
+                    self.send_json({"error": f"Evidence unavailable: {exc}"}, 502); return
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_POST(self):
@@ -508,7 +916,9 @@ class Handler(BaseHTTPRequestHandler):
                     org_id=int(body.get("organization_id",0)); row=db.execute("SELECT * FROM organizations WHERE id=?",(org_id,)).fetchone()
                     if not row: self.send_json({"error":"Organization not found"},404); return
                     token=cookie_value(self,"user_sid") or secrets.token_urlsafe(24); USER_SESSIONS[token]=org_id
+                    db.execute("INSERT INTO user_sessions(session_id,organization_id,created_at,last_seen) VALUES(?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET organization_id=excluded.organization_id,last_seen=excluded.last_seen", (token, org_id, now_iso(), now_iso()))
                     self._cookies=[f"user_sid={token}; HttpOnly; SameSite=Strict; Path=/"]
+                    db.commit()
                     self.send_json({"organization":dict(row)}); return
                 if path == "/api/resources":
                     self.send_json(create_resource(db,body,self.user_org(db)["id"]),201); return
@@ -520,6 +930,8 @@ class Handler(BaseHTTPRequestHandler):
                 if m: self.send_json(mission_user_action(db,int(m.group(1)),m.group(2),self.user_org(db)["id"])); return
                 m=re.fullmatch(r"/api/missions/(\d+)/disputes",path)
                 if m: self.send_json(create_dispute(db,int(m.group(1)),body,self.user_org(db)["id"]),201); return
+                m=re.fullmatch(r"/api/disputes/(\d+)/resolve",path)
+                if m: self.send_json(victim_resolve_dispute(db,int(m.group(1)),self.user_org(db)["id"],body)); return
                 # Legacy allocation controls are deliberately unavailable to users.
                 if path == "/api/allocation/batch" or re.fullmatch(r"/api/missions/(\d+)/allocate",path):
                     self.send_json({"error":"Allocation is managed by the admin scheduler"},403); return
@@ -534,11 +946,11 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(admin_run_batch(db)); return
                 if path == "/api/admin/demo/run":
                     if not self.admin_ok(): self.send_json({"error":"Admin authentication required"},401); return
-                    self.send_json(run_demo(db),201); return
+                    self.send_json(run_demo(db, body),201); return
                 m=re.fullmatch(r"/api/admin/missions/(\d+)/(withdraw|checkout|complete|no-show)",path)
                 if m:
                     if not self.admin_ok(): self.send_json({"error":"Admin authentication required"},401); return
-                    self.send_json(admin_mission_action(db,int(m.group(1)),m.group(2))); return
+                    self.send_json(admin_mission_action(db,int(m.group(1)),m.group(2),body)); return
                 m=re.fullmatch(r"/api/admin/disputes/(\d+)/resolve",path)
                 if m:
                     if not self.admin_ok(): self.send_json({"error":"Admin authentication required"},401); return
@@ -577,7 +989,7 @@ def get_bootstrap(db: sqlite3.Connection, organization_id: int = 1) -> dict:
     resources = [row_to_resource(r) for r in db.execute("SELECT r.*,o.short_name AS owner_name FROM resources r JOIN organizations o ON o.id=r.owner_org_id WHERE (r.status='available' AND o.suspended=0) OR r.owner_org_id=? ORDER BY r.status,r.name", (user["id"],)).fetchall()]
     events = [dict(r) for r in db.execute("SELECT id,kind,title,detail,created_at FROM events WHERE audience_org_id=? ORDER BY created_at DESC LIMIT 20", (user["id"],)).fetchall()]
     organizations = [{"id":r["id"],"name":r["name"],"short_name":r["short_name"],"kind":r["kind"]} for r in db.execute("SELECT * FROM organizations ORDER BY name").fetchall()]
-    return {"organization":dict(user), "organizations":organizations, "missions":missions, "resources":resources, "events":events, "metrics":get_metrics(db,user["id"]) }
+    return {"organization":dict(user), "organizations":organizations, "missions":missions, "resources":resources, "events":events, "history":get_history(db,user["id"],50), "metrics":get_metrics(db,user["id"]), "version":database_version(db) }
 
 
 def get_metrics(db: sqlite3.Connection, organization_id: int | None = None) -> dict:
@@ -595,7 +1007,18 @@ def get_metrics(db: sqlite3.Connection, organization_id: int | None = None) -> d
     for m in missions:
         org=db.execute("SELECT * FROM organizations WHERE id=?",(m["requester_org_id"],)).fetchone()
         if org: scores.append(org_fairness(org,m,len(loads(m["plans"],[])))["score"])
-    return {"resource_count":resource_count,"active_hours":round(active_hours,1),"missions":len(missions),"allocation_success_rate":round(successful/max(1,len(missions)),2),"first_choice_satisfaction":0.67,"resource_concentration":0.41,"estimated_cost_saved":round(resource_count*47.5+successful*120,0),"fairness_index":round(sum(scores)/max(1,len(scores)),2)}
+    if organization_id:
+        completed=db.execute("SELECT b.*,r.owner_org_id,r.external_hourly_cost,m.requester_org_id FROM bookings b JOIN resources r ON r.id=b.resource_id JOIN missions m ON m.id=b.mission_id WHERE b.status='completed' AND m.requester_org_id=?",(organization_id,)).fetchall()
+        decisions=db.execute("SELECT d.* FROM decisions d JOIN missions m ON m.id=d.mission_id WHERE m.requester_org_id=?",(organization_id,)).fetchall()
+    else:
+        completed=db.execute("SELECT b.*,r.owner_org_id,r.external_hourly_cost,m.requester_org_id FROM bookings b JOIN resources r ON r.id=b.resource_id JOIN missions m ON m.id=b.mission_id WHERE b.status='completed'").fetchall()
+        decisions=db.execute("SELECT * FROM decisions").fetchall()
+    estimated_cost_saved=sum(window_hours(row["start_at"],row["end_at"])*float(row["quantity"])*float(row["external_hourly_cost"] or 0) for row in completed)
+    first_choice=[row for row in decisions if row["outcome"] == "allocated" and loads(row["submitted_preferences"],[]) and row["chosen_plan"] == loads(row["submitted_preferences"],[])[0]]
+    providers={row["owner_org_id"] for row in completed}
+    concentration=(len(providers)/len(completed)) if completed else 0.0
+    decision_scores=[float(row["fairness_score"]) for row in decisions if row["fairness_score"] is not None]
+    return {"resource_count":resource_count,"active_hours":round(active_hours,1),"missions":len(missions),"allocation_success_rate":round(successful/max(1,len(missions)),2),"first_choice_satisfaction":round(len(first_choice)/max(1,len([row for row in decisions if row["outcome"] == "allocated"])),2),"resource_concentration":round(concentration,2),"estimated_cost_saved":round(estimated_cost_saved,2),"fairness_index":round(sum(decision_scores)/max(1,len(decision_scores)),2) if decision_scores else round(sum(scores)/max(1,len(scores)),2)}
 
 
 def create_resource(db: sqlite3.Connection, body: dict, owner_org_id: int) -> dict:
@@ -606,9 +1029,14 @@ def create_resource(db: sqlite3.Connection, body: dict, owner_org_id: int) -> di
     if not a or not b or b<=a: raise ValueError("Availability window is invalid")
     status=body.get("status","available")
     if status not in ("available","offline","maintenance"): raise ValueError("Invalid resource status")
-    cur=db.execute("INSERT INTO resources(owner_org_id,name,type,capability,features,availability_start,availability_end,location,capacity,condition,hourly_value,verified,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(owner_org_id,body["name"],body["type"],body["capability"],body.get("features",""),a.isoformat(),b.isoformat(),body["location"],max(0.01,float(body.get("capacity",1))),body.get("condition","Good"),max(0,float(body.get("hourly_value",0))),1,status,now_iso()))
-    add_event(db,"resource","New resource added",f"{body['name']} is now visible in the shared pool.",owner_org_id); db.commit()
-    row=db.execute("SELECT r.*,o.short_name AS owner_name FROM resources r JOIN organizations o ON o.id=r.owner_org_id WHERE r.id=?",(cur.lastrowid,)).fetchone()
+    hourly_value=max(0,float(body.get("hourly_value",0)))
+    external_cost=max(0,float(body.get("external_hourly_cost",hourly_value)))
+    resource_id=insert_id(db,"INSERT INTO resources(owner_org_id,name,type,capability,features,availability_start,availability_end,location,capacity,condition,hourly_value,external_hourly_cost,cost_source,verified,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(owner_org_id,body["name"],body["type"],body["capability"],body.get("features",""),a.isoformat(),b.isoformat(),body["location"],max(0.01,float(body.get("capacity",1))),body.get("condition","Good"),hourly_value,external_cost,body.get("cost_source","user estimate"),1,status,now_iso()))
+    row=db.execute("SELECT r.*,o.short_name AS owner_name FROM resources r JOIN organizations o ON o.id=r.owner_org_id WHERE r.id=?",(resource_id,)).fetchone()
+    add_event(db,"resource","New resource added",f"{body['name']} is now visible in the shared pool.",owner_org_id)
+    if status == "available": record_contribution_event(db,owner_org_id,"VERIFIED_AVAILABILITY",window_hours(row["availability_start"],row["availability_end"]),row["id"],details="resource published")
+    add_history(db,"resource",row["id"],owner_org_id,"created",row)
+    db.commit()
     return {"resource":row_to_resource(row)}
 
 
@@ -622,9 +1050,12 @@ def create_mission(db: sqlite3.Connection, body: dict, requester_org_id: int) ->
     if deadline>=start: deadline=start-timedelta(hours=24)
     requirements=parse_requirements(body["title"]+" "+body["description"])
     plans=build_plans(db,requirements,body["location"],start.isoformat(),end.isoformat(),requester_org_id)
-    created=now_iso(); cur=db.execute("INSERT INTO missions(requester_org_id,title,description,location,start_at,end_at,deadline,status,requirements,plans,preferences,replacement_pending,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(requester_org_id,body["title"],body["description"],body["location"],start.isoformat(),end.isoformat(),deadline.isoformat(),"open",dumps(requirements),dumps(plans),dumps([p["id"] for p in plans]),0,created,created))
-    add_event(db,"mission","Mission submitted",f"{body['title']} is open until the application cutoff.",requester_org_id); db.commit()
-    return {"mission":row_to_mission(db.execute("SELECT * FROM missions WHERE id=?",(cur.lastrowid,)).fetchone(),db,True)}
+    created=now_iso(); mission_id=insert_id(db,"INSERT INTO missions(requester_org_id,title,description,location,start_at,end_at,deadline,status,requirements,plans,preferences,replacement_pending,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(requester_org_id,body["title"],body["description"],body["location"],start.isoformat(),end.isoformat(),deadline.isoformat(),"open",dumps(requirements),dumps(plans),dumps([p["id"] for p in plans]),0,created,created))
+    row=db.execute("SELECT * FROM missions WHERE id=?",(mission_id,)).fetchone()
+    add_event(db,"mission","Mission submitted",f"{body['title']} is open until the application cutoff.",requester_org_id)
+    add_history(db,"mission",row["id"],requester_org_id,"created",row)
+    db.commit()
+    return {"mission":row_to_mission(row,db,True)}
 
 
 def save_preferences(db: sqlite3.Connection, mission_id: int, body: dict, requester_org_id: int) -> dict:
@@ -634,8 +1065,10 @@ def save_preferences(db: sqlite3.Connection, mission_id: int, body: dict, reques
     if not row["replacement_pending"] and parse_dt(row["deadline"]) and parse_dt(row["deadline"]) <= datetime.now(UTC): raise ValueError("Application window is closed")
     plans=loads(row["plans"],[]); valid={p["id"] for p in plans}; prefs=body.get("preferences")
     if not isinstance(prefs,list) or not prefs or any(p not in valid for p in prefs): raise ValueError("Preferences must be an ordered list of valid plans")
-    db.execute("UPDATE missions SET preferences=?,replacement_pending=0,updated_at=? WHERE id=?",(dumps(prefs),now_iso(),mission_id)); db.commit()
-    return {"preferences":prefs,"mission":row_to_mission(db.execute("SELECT * FROM missions WHERE id=?",(mission_id,)).fetchone(),db,True)}
+    db.execute("UPDATE missions SET preferences=?,replacement_pending=0,updated_at=? WHERE id=?",(dumps(prefs),now_iso(),mission_id))
+    updated=db.execute("SELECT * FROM missions WHERE id=?",(mission_id,)).fetchone()
+    add_history(db,"mission",mission_id,requester_org_id,"preferences_updated",updated); db.commit()
+    return {"preferences":prefs,"mission":row_to_mission(updated,db,True)}
 
 
 def overlap(a1,a2,b1,b2):
@@ -668,20 +1101,122 @@ def mission_user_action(db, mission_id, action, org_id):
     if action=="withdraw":
         db.execute("UPDATE bookings SET status='released' WHERE mission_id=? AND status='active'",(mission_id,))
         db.execute("UPDATE resources SET status='available' WHERE id IN (SELECT resource_id FROM bookings WHERE mission_id=?) AND status='reserved'",(mission_id,))
-        db.execute("UPDATE organizations SET credit_score=MAX(0,credit_score-3) WHERE id=?",(org_id,))
+        record_credit_event(db,org_id,"MISSION_WITHDRAWN",-3,mission_id,"User withdrew an active Mission")
     elif action=="checkout" and row["status"]!="allocated": raise ValueError("Mission is not allocated")
     elif action=="complete" and row["status"] not in ("allocated","in_use"): raise ValueError("Mission is not active")
-    db.execute("UPDATE missions SET status=?,updated_at=? WHERE id=?",(target,now_iso(),mission_id)); add_event(db,"mission",f"Mission {target}",row["title"],org_id); db.commit()
-    return {"mission":row_to_mission(db.execute("SELECT * FROM missions WHERE id=?",(mission_id,)).fetchone(),db,True)}
+    if action == "complete":
+        completed_at=now_iso()
+        bookings=db.execute("SELECT b.*,r.owner_org_id FROM bookings b JOIN resources r ON r.id=b.resource_id WHERE b.mission_id=? AND b.status='active'",(mission_id,)).fetchall()
+        db.execute("UPDATE bookings SET status='completed',completed_at=? WHERE mission_id=? AND status='active'",(completed_at,mission_id))
+        for booking in bookings:
+            record_contribution_event(db,booking["owner_org_id"],"ACTUAL_SHARE",window_hours(booking["start_at"],booking["end_at"])*float(booking["quantity"]),booking["resource_id"],mission_id,"completed booking")
+    db.execute("UPDATE missions SET status=?,updated_at=? WHERE id=?",(target,now_iso(),mission_id))
+    updated=db.execute("SELECT * FROM missions WHERE id=?",(mission_id,)).fetchone()
+    add_event(db,"mission",f"Mission {target}",row["title"],org_id); add_history(db,"mission",mission_id,org_id,f"status_{target}",updated); db.commit()
+    return {"mission":row_to_mission(updated,db,True)}
+
+
+def mission_provider_ids(db: sqlite3.Connection, mission: sqlite3.Row) -> list[int]:
+    """Return resource-owner organizations involved in a Mission."""
+    ids = {int(r["owner_org_id"]) for r in db.execute("SELECT DISTINCT r.owner_org_id FROM bookings b JOIN resources r ON r.id=b.resource_id WHERE b.mission_id=?", (mission["id"],)).fetchall()}
+    if not ids and mission["allocated_plan_id"]:
+        plan = next((p for p in loads(mission["plans"], []) if p.get("id") == mission["allocated_plan_id"]), None)
+        for item in (plan or {}).get("items", []):
+            resource = db.execute("SELECT owner_org_id FROM resources WHERE id=?", (item.get("resource_id"),)).fetchone()
+            if resource: ids.add(int(resource["owner_org_id"]))
+    return sorted(ids)
+
+
+def normalized_evidence(body: dict) -> list[dict]:
+    evidence = body.get("evidence") or []
+    if not isinstance(evidence, list): raise ValueError("Evidence must be a list")
+    normalized = []
+    for item in evidence[:5]:
+        if not isinstance(item, dict) or not item.get("name"): continue
+        data = str(item.get("data") or "")
+        # Evidence is kept in the local SQLite store for the demo. Keep each
+        # encoded attachment bounded so one dispute cannot exhaust the DB.
+        if len(data) > 2_500_000: raise ValueError("Each evidence file must be smaller than 2 MB")
+        normalized.append({"name": str(item["name"])[:160], "type": str(item.get("type") or "application/octet-stream")[:120], "size": int(item.get("size") or 0), "data": data})
+    return normalized
+
+
+def supabase_headers(content_type: str | None = None) -> dict[str, str]:
+    headers = {"apikey": SUPABASE_SECRET_KEY, "Authorization": f"Bearer {SUPABASE_SECRET_KEY}"}
+    if content_type: headers["Content-Type"] = content_type
+    return headers
+
+
+def cloud_evidence_enabled() -> bool:
+    return bool(SUPABASE_URL and SUPABASE_SECRET_KEY)
+
+
+def persist_evidence_to_supabase(evidence: list[dict], mission_id: int) -> list[dict]:
+    """Upload evidence bytes to a private Supabase Storage bucket.
+
+    The database keeps only metadata and an object path when cloud storage is
+    configured. Without credentials, the local demo retains the data URL so it
+    remains self-contained and viewable.
+    """
+    if not evidence: return evidence
+    if not cloud_evidence_enabled(): return evidence
+    bucket = urllib.parse.quote(SUPABASE_EVIDENCE_BUCKET, safe="")
+    try:
+        request = urllib.request.Request(f"{SUPABASE_URL}/storage/v1/bucket", data=json.dumps({"id": SUPABASE_EVIDENCE_BUCKET, "name": SUPABASE_EVIDENCE_BUCKET, "public": False}).encode(), headers=supabase_headers("application/json"), method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=12): pass
+        except urllib.error.HTTPError as exc:
+            if exc.code != 409: raise
+        uploaded = []
+        for item in evidence:
+            data_url = item.get("data", "")
+            if not data_url.startswith("data:") or "," not in data_url: raise ValueError("Evidence file content is missing")
+            encoded = data_url.split(",", 1)[1]
+            raw = base64.b64decode(encoded, validate=True)
+            safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", item.get("name", "evidence"))[:100] or "evidence"
+            path = f"mission-{mission_id}/{uuid.uuid4().hex}-{safe_name}"
+            target = f"{SUPABASE_URL}/storage/v1/object/{bucket}/{urllib.parse.quote(path, safe='/')}"
+            request = urllib.request.Request(target, data=raw, headers={**supabase_headers(item.get("type") or "application/octet-stream"), "x-upsert": "false"}, method="POST")
+            with urllib.request.urlopen(request, timeout=20): pass
+            uploaded.append({"name": item["name"], "type": item.get("type") or "application/octet-stream", "size": len(raw), "path": path, "storage": "supabase"})
+        return uploaded
+    except (OSError, ValueError, urllib.error.URLError, urllib.error.HTTPError, binascii.Error) as exc:
+        raise ValueError(f"Cloud evidence upload failed. Check your Supabase configuration and try again: {exc}") from exc
+
+
+def load_cloud_evidence(path: str) -> tuple[bytes, str]:
+    if not cloud_evidence_enabled(): raise ValueError("Supabase is not configured")
+    target = f"{SUPABASE_URL}/storage/v1/object/{urllib.parse.quote(SUPABASE_EVIDENCE_BUCKET, safe='')}/{urllib.parse.quote(path, safe='/')}"
+    request = urllib.request.Request(target, headers=supabase_headers(), method="GET")
+    with urllib.request.urlopen(request, timeout=20) as response:
+        return response.read(), response.headers.get_content_type() or "application/octet-stream"
 
 
 def create_dispute(db: sqlite3.Connection, mission_id: int, body: dict, reporter_org_id: int) -> dict:
-    row=db.execute("SELECT * FROM missions WHERE id=? AND requester_org_id=?",(mission_id,reporter_org_id)).fetchone()
+    row = db.execute("SELECT * FROM missions WHERE id=? AND requester_org_id=?", (mission_id, reporter_org_id)).fetchone()
     if not row: raise ValueError("Mission not found")
-    if not body.get("description"): raise ValueError("Describe the issue")
-    cur=db.execute("INSERT INTO disputes(mission_id,reporter_org_id,category,description,status,created_at) VALUES(?,?,?,?,?,?)",(mission_id,reporter_org_id,body.get("category","condition"),body["description"],"open",now_iso()))
-    add_event(db,"conflict","Dispute opened",f"A {body.get('category','condition')} dispute was attached to {row['title']}.",reporter_org_id); db.commit()
-    return {"dispute":dict(db.execute("SELECT * FROM disputes WHERE id=?",(cur.lastrowid,)).fetchone())}
+    if not body.get("description"): raise ValueError("Please describe what happened")
+    category = body.get("category", "condition")
+    try: amount = max(0.0, float(body.get("compensation_amount") or 0))
+    except (TypeError, ValueError): raise ValueError("Compensation amount must be a valid number")
+    evidence = normalized_evidence(body)
+    # The requester cannot be the accused party in its own dispute; only
+    # external resource providers are eligible for a provider-fault claim.
+    providers = [provider_id for provider_id in mission_provider_ids(db, row) if provider_id != reporter_org_id]
+    requested_accused = body.get("accused_org_id")
+    accused_id = int(requested_accused) if requested_accused not in (None, "") else (providers[0] if len(providers) == 1 else None)
+    if accused_id is not None and accused_id not in providers: raise ValueError("The provider at fault must be an organization that supplied a resource for this Mission")
+    if not accused_id: raise ValueError("The provider at fault could not be identified. Select the resource provider organization")
+    if amount > 0 and not evidence: raise ValueError("A compensation request must include at least one evidence file")
+    evidence = persist_evidence_to_supabase(evidence, mission_id)
+    compensation_status = "requested" if amount > 0 else "not_requested"
+    dispute_id = insert_id(db, "INSERT INTO disputes(mission_id,reporter_org_id,accused_org_id,category,description,compensation_amount,evidence,compensation_status,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)", (mission_id, reporter_org_id, accused_id, category, body["description"], amount, dumps(evidence), compensation_status, "open", now_iso()))
+    dispute = db.execute("SELECT * FROM disputes WHERE id=?", (dispute_id,)).fetchone()
+    detail = f"{category} dispute on {row['title']}" + (f"; compensation request HKD {amount:.2f}" if amount else "")
+    add_event(db, "conflict", "Dispute opened", detail, reporter_org_id)
+    add_history(db, "dispute", dispute["id"], reporter_org_id, "created", dispute)
+    db.commit()
+    return {"dispute": row_to_dispute(dispute, db)}
 
 
 def admin_run_batch(db):
@@ -689,32 +1224,39 @@ def admin_run_batch(db):
     rows=db.execute("SELECT * FROM missions WHERE status IN ('open','waitlisted') AND deadline<=? ORDER BY deadline,id",(now.isoformat(),)).fetchall()
     ranked=[]
     for row in rows:
-        org=db.execute("SELECT * FROM organizations WHERE id=?",(row["requester_org_id"],)).fetchone(); score=org_fairness(org,row,len(loads(row["plans"],[])),weights)["score"] if org else 0
-        ranked.append((score,row))
-    ranked.sort(key=lambda x:(-x[0],parse_dt(x[1]["deadline"]) or datetime.max.replace(tzinfo=UTC))); allocated=[];waitlisted=[]
-    for score,row in ranked:
+        org=db.execute("SELECT * FROM organizations WHERE id=?",(row["requester_org_id"],)).fetchone(); fairness=org_fairness(org,row,len(loads(row["plans"],[])),weights) if org else {"score":0}
+        ranked.append((fairness["score"],fairness,row))
+    ranked.sort(key=lambda x:(-x[0],parse_dt(x[2]["deadline"]) or datetime.max.replace(tzinfo=UTC))); allocated=[];waitlisted=[]
+    for score,fairness,row in ranked:
         if row["replacement_pending"]:
+            record_decision(db,row,fairness,None,"replacement_pending",weights,"An approved resource is unavailable; user confirmation is required before replacement.")
             waitlisted.append({"mission_id":row["id"],"title":row["title"],"fairness":{"score":round(score,3)},"replacement_pending":True})
             continue
         org=db.execute("SELECT * FROM organizations WHERE id=?",(row["requester_org_id"],)).fetchone()
-        if not org or org["credit_score"]<=70: chosen=None
+        if not org or org["suspended"]: chosen=None
         else:
             plans=loads(row["plans"],[]); prefs=loads(row["preferences"],[]) or [p["id"] for p in plans]
-            chosen=next((p for p in plans if p["id"] in prefs and plan_available(db,row,p)),None)
+            plan_by_id={p["id"]:p for p in plans}
+            chosen=next((plan_by_id[plan_id] for plan_id in prefs if plan_id in plan_by_id and plan_available(db,row,plan_by_id[plan_id])),None)
         if not chosen:
             if row["status"]=="open": db.execute("UPDATE organizations SET allocations_lost=allocations_lost+1 WHERE id=?",(row["requester_org_id"],))
             db.execute("UPDATE missions SET status='waitlisted',updated_at=? WHERE id=?",(now_iso(),row["id"]))
-            waitlisted.append({"mission_id":row["id"],"title":row["title"],"fairness":{"score":round(score,3)}}); db.execute("INSERT INTO decisions(mission_id,fairness_score,chosen_plan,outcome,created_at) VALUES(?,?,?,?,?)",(row["id"],round(score,3),None,"waitlisted",now_iso())); continue
-        reserve_plan(db,row,chosen); db.execute("UPDATE missions SET status='allocated',allocated_plan_id=?,updated_at=? WHERE id=?",(chosen["id"],now_iso(),row["id"])); db.execute("UPDATE organizations SET allocations_won=allocations_won+1 WHERE id=?",(row["requester_org_id"],)); add_event(db,"allocation","Mission approved",f"{row['title']} received an approved plan.",row["requester_org_id"]); allocated.append({"mission_id":row["id"],"title":row["title"],"plan_id":chosen["id"],"fairness":{"score":round(score,3)}}); db.execute("INSERT INTO decisions(mission_id,fairness_score,chosen_plan,outcome,created_at) VALUES(?,?,?,?,?)",(row["id"],round(score,3),chosen["id"],"allocated",now_iso()))
+            updated=db.execute("SELECT * FROM missions WHERE id=?",(row["id"],)).fetchone()
+            add_history(db,"mission",row["id"],row["requester_org_id"],"status_waitlisted",updated)
+            waitlisted.append({"mission_id":row["id"],"title":row["title"],"fairness":{"score":round(score,3)}}); record_decision(db,row,fairness,None,"waitlisted",weights,"No preferred plan was feasible after capacity and time-conflict checks."); continue
+        reserve_plan(db,row,chosen); db.execute("UPDATE missions SET status='allocated',allocated_plan_id=?,updated_at=? WHERE id=?",(chosen["id"],now_iso(),row["id"]))
+        updated=db.execute("SELECT * FROM missions WHERE id=?",(row["id"],)).fetchone()
+        db.execute("UPDATE organizations SET allocations_won=allocations_won+1 WHERE id=?",(row["requester_org_id"],)); add_event(db,"allocation","Mission approved",f"{row['title']} received an approved plan.",row["requester_org_id"]); add_history(db,"mission",row["id"],row["requester_org_id"],"status_allocated",updated); record_decision(db,row,fairness,chosen,"allocated",weights,f"Selected {chosen['id']} as the first feasible plan in the submitted preference order."); allocated.append({"mission_id":row["id"],"title":row["title"],"plan_id":chosen["id"],"fairness":{"score":round(score,3)}})
     db.commit(); return {"allocated":allocated,"waitlisted":waitlisted,"processed_at":now_iso(),"message":f"Due batch: {len(allocated)} approved, {len(waitlisted)} waitlisted"}
 
 
 def update_resource(db, resource_id, body, owner_id=None, admin=False):
     row=db.execute("SELECT * FROM resources WHERE id=?",(resource_id,)).fetchone()
     if not row or (owner_id is not None and row["owner_org_id"]!=owner_id): raise ValueError("Resource not found")
-    fields={k:body[k] for k in ("name","type","capability","features","location","condition","status") if k in body}
+    fields={k:body[k] for k in ("name","type","capability","features","location","condition","status","cost_source") if k in body}
     for k in ("capacity","hourly_value"):
         if k in body: fields[k]=max(0,float(body[k]))
+    if "external_hourly_cost" in body: fields["external_hourly_cost"]=max(0,float(body["external_hourly_cost"]))
     for k in ("availability_start","availability_end"):
         if k in body:
             if not parse_dt(body[k]): raise ValueError("Invalid availability")
@@ -727,66 +1269,238 @@ def update_resource(db, resource_id, body, owner_id=None, admin=False):
         for x in affected:
             mm=db.execute("SELECT * FROM missions WHERE id=?",(x["mission_id"],)).fetchone()
             db.execute("UPDATE missions SET status='waitlisted',allocated_plan_id=NULL,replacement_pending=1,updated_at=? WHERE id=? AND status='allocated'",(now_iso(),x["mission_id"]))
-            if mm: add_event(db,"replacement","Approved resource unavailable; replacement plans await user confirmation",mm["title"],mm["requester_org_id"])
+            updated_mission=db.execute("SELECT * FROM missions WHERE id=?",(x["mission_id"],)).fetchone()
+            if mm:
+                add_event(db,"replacement","Approved resource unavailable; replacement plans await user confirmation",mm["title"],mm["requester_org_id"])
+                add_history(db,"mission",mm["id"],mm["requester_org_id"],"replacement_pending",updated_mission)
+    old_available_hours=window_hours(row["availability_start"],row["availability_end"]) if row["status"] == "available" else 0.0
+    next_start=fields.get("availability_start",row["availability_start"]); next_end=fields.get("availability_end",row["availability_end"]); next_status=fields.get("status",row["status"])
+    new_available_hours=window_hours(next_start,next_end) if next_status == "available" else 0.0
     if fields:
         db.execute("UPDATE resources SET "+",".join(f"{k}=?" for k in fields)+" WHERE id=?",(*fields.values(),resource_id))
-    add_event(db,"resource","Resource updated",row["name"],row["owner_org_id"]); db.commit()
-    return {"resource":row_to_resource(db.execute("SELECT r.*,o.short_name AS owner_name FROM resources r JOIN organizations o ON o.id=r.owner_org_id WHERE r.id=?",(resource_id,)).fetchone())}
+    updated=db.execute("SELECT r.*,o.short_name AS owner_name FROM resources r JOIN organizations o ON o.id=r.owner_org_id WHERE r.id=?",(resource_id,)).fetchone()
+    add_event(db,"resource","Resource updated",row["name"],row["owner_org_id"])
+    record_contribution_event(db,row["owner_org_id"],"VERIFIED_AVAILABILITY",new_available_hours-old_available_hours,resource_id,details="resource availability updated")
+    add_history(db,"resource",resource_id,row["owner_org_id"],"updated",updated); db.commit()
+    return {"resource":row_to_resource(updated)}
 
 
 def update_organization(db, org_id, body):
     allowed={k:body[k] for k in ("credit_score","verified","suspended") if k in body}
     # verified/suspended are additive attributes in the response; preserve in kind if old DB has no columns.
-    if "credit_score" in allowed: db.execute("UPDATE organizations SET credit_score=? WHERE id=?",(float(allowed["credit_score"]),org_id))
+    if "credit_score" in allowed:
+        current=db.execute("SELECT credit_score FROM organizations WHERE id=?",(org_id,)).fetchone()
+        if current:
+            record_credit_event(db,org_id,"ADMIN_ADJUSTMENT",float(allowed["credit_score"])-float(current["credit_score"]),None,"Admin adjusted the organization credit score")
+    if "suspended" in allowed and not bool(allowed["suspended"]):
+        pending = db.execute("SELECT 1 FROM disputes WHERE accused_org_id=? AND status='awaiting_victim' LIMIT 1", (org_id,)).fetchone()
+        if pending: raise ValueError("This organization still has a compensation dispute awaiting requester confirmation and cannot be unfrozen yet")
     for key in ("verified","suspended"):
         if key in allowed: db.execute(f"UPDATE organizations SET {key}=? WHERE id=?",(int(bool(allowed[key])),org_id))
-    db.commit(); return {"organization":dict(db.execute("SELECT * FROM organizations WHERE id=?",(org_id,)).fetchone())}
+    updated=db.execute("SELECT * FROM organizations WHERE id=?",(org_id,)).fetchone()
+    add_history(db,"organization",org_id,org_id,"updated",updated)
+    db.commit(); return {"organization":dict(updated)}
 
 
 def update_config(db, body):
     current=db.execute("SELECT * FROM admin_config WHERE id=1").fetchone(); weights=body.get("weights") or loads(current["weights"],{})
-    db.execute("UPDATE admin_config SET scheduler_enabled=?,interval_seconds=?,weights=? WHERE id=1",(int(bool(body.get("scheduler_enabled",current["scheduler_enabled"]))),max(5,int(body.get("interval_seconds",current["interval_seconds"]))),dumps(weights))); db.commit(); result=dict(db.execute("SELECT * FROM admin_config WHERE id=1").fetchone()); result["weights"]=loads(result["weights"],{}); return {"config":result}
+    db.execute("UPDATE admin_config SET scheduler_enabled=?,interval_seconds=?,weights=? WHERE id=1",(int(bool(body.get("scheduler_enabled",current["scheduler_enabled"]))),max(5,int(body.get("interval_seconds",current["interval_seconds"]))),dumps(weights)))
+    updated=db.execute("SELECT * FROM admin_config WHERE id=1").fetchone(); add_history(db,"platform",1,None,"config_updated",updated); db.commit(); result=dict(updated); result["weights"]=loads(result["weights"],{}); return {"config":result}
 
 
 def get_admin_bootstrap(db):
     config=dict(db.execute("SELECT * FROM admin_config WHERE id=1").fetchone()); config["weights"]=loads(config.get("weights"),{})
-    return {"organizations":[dict(r) for r in db.execute("SELECT * FROM organizations ORDER BY name")],"resources":[row_to_resource(r) for r in db.execute("SELECT r.*,o.short_name AS owner_name FROM resources r JOIN organizations o ON o.id=r.owner_org_id ORDER BY r.id")],"missions":[row_to_mission(r,db,True) for r in db.execute("SELECT * FROM missions ORDER BY id")],"events":[dict(r) for r in db.execute("SELECT * FROM events ORDER BY created_at DESC")],"decisions":[dict(r) for r in db.execute("SELECT * FROM decisions ORDER BY id DESC")],"bookings":[dict(r) for r in db.execute("SELECT * FROM bookings ORDER BY id")],"config":config,"demo_runs":[dict(r) for r in db.execute("SELECT * FROM demo_runs ORDER BY id DESC")],"disputes":[dict(r) for r in db.execute("SELECT * FROM disputes ORDER BY id DESC")],"metrics":get_metrics(db)}
+    return {"organizations":[dict(r) for r in db.execute("SELECT * FROM organizations ORDER BY name")],"resources":[row_to_resource(r) for r in db.execute("SELECT r.*,o.short_name AS owner_name FROM resources r JOIN organizations o ON o.id=r.owner_org_id ORDER BY r.id")],"missions":[row_to_mission(r,db,True) for r in db.execute("SELECT * FROM missions ORDER BY id")],"events":[dict(r) for r in db.execute("SELECT * FROM events ORDER BY created_at DESC")],"history":get_history(db),"credit_events":[dict(r) for r in db.execute("SELECT * FROM credit_events ORDER BY id DESC LIMIT 200")],"contribution_events":[dict(r) for r in db.execute("SELECT * FROM contribution_events ORDER BY id DESC LIMIT 200")],"decisions":[dict(r) for r in db.execute("SELECT * FROM decisions ORDER BY id DESC")],"bookings":[dict(r) for r in db.execute("SELECT * FROM bookings ORDER BY id")],"config":config,"demo_runs":[dict(r) for r in db.execute("SELECT * FROM demo_runs ORDER BY id DESC")],"disputes":[row_to_dispute(r,db) for r in db.execute("SELECT * FROM disputes ORDER BY id DESC")],"metrics":get_metrics(db),"cloud":{"provider":"Supabase","database_backend":DB_BACKEND,"database_shared":DB_BACKEND == "supabase","evidence_configured":cloud_evidence_enabled(),"evidence_bucket":SUPABASE_EVIDENCE_BUCKET if cloud_evidence_enabled() else None},"version":database_version(db)}
 
 
-def admin_mission_action(db, mission_id, action):
+def admin_mission_action(db, mission_id, action, body=None):
     row=db.execute("SELECT * FROM missions WHERE id=?",(mission_id,)).fetchone()
     if not row: raise ValueError("Mission not found")
     if action=="withdraw":
         db.execute("UPDATE bookings SET status='released' WHERE mission_id=? AND status='active'",(mission_id,)); db.execute("UPDATE resources SET status='available' WHERE id IN (SELECT resource_id FROM bookings WHERE mission_id=?) AND status='reserved'",(mission_id,)); target="withdrawn"
     elif action=="checkout": target="in_use"
-    elif action=="complete": target="completed"; db.execute("UPDATE bookings SET status='completed' WHERE mission_id=?",(mission_id,))
-    elif action=="no-show": target="completed"; db.execute("UPDATE bookings SET status='released' WHERE mission_id=?",(mission_id,)); db.execute("UPDATE organizations SET credit_score=MAX(0,credit_score-8) WHERE id=?",(row["requester_org_id"],))
+    elif action=="complete":
+        target="completed"; bookings=db.execute("SELECT b.*,r.owner_org_id FROM bookings b JOIN resources r ON r.id=b.resource_id WHERE b.mission_id=? AND b.status='active'",(mission_id,)); completed_at=now_iso(); db.execute("UPDATE bookings SET status='completed',completed_at=? WHERE mission_id=?",(completed_at,mission_id))
+        for booking in bookings:
+            record_contribution_event(db,booking["owner_org_id"],"ACTUAL_SHARE",window_hours(booking["start_at"],booking["end_at"])*float(booking["quantity"]),booking["resource_id"],mission_id,"admin completed booking")
+    elif action=="no-show":
+        target="completed"
+        bookings = db.execute("SELECT b.*,r.owner_org_id FROM bookings b JOIN resources r ON r.id=b.resource_id WHERE b.mission_id=? AND b.status IN ('active','completed')", (mission_id,)).fetchall()
+        db.execute("UPDATE bookings SET status='released' WHERE mission_id=? AND status='active'", (mission_id,))
+        provider_ids = sorted({int(booking["owner_org_id"]) for booking in bookings})
+        requested_provider = (body or {}).get("provider_org_id")
+        provider_id = int(requested_provider) if requested_provider not in (None, "") else (provider_ids[0] if len(provider_ids) == 1 else None)
+        if not provider_id or provider_id not in provider_ids: raise ValueError("Select the resource provider organization responsible for the breach")
+        record_credit_event(db, provider_id, "PROVIDER_NO_SHOW", -8, mission_id, "Admin recorded a provider no-show")
     else: raise ValueError("Unknown action")
-    db.execute("UPDATE missions SET status=?,updated_at=? WHERE id=?",(target,now_iso(),mission_id)); add_event(db,"admin",f"Mission {target}",row["title"],row["requester_org_id"]); db.commit(); return {"mission":row_to_mission(db.execute("SELECT * FROM missions WHERE id=?",(mission_id,)).fetchone(),db,True)}
+    db.execute("UPDATE missions SET status=?,updated_at=? WHERE id=?",(target,now_iso(),mission_id)); updated=db.execute("SELECT * FROM missions WHERE id=?",(mission_id,)).fetchone(); add_event(db,"admin",f"Mission {target}",row["title"],row["requester_org_id"]); add_history(db,"mission",mission_id,row["requester_org_id"],f"status_{target}",updated); db.commit(); return {"mission":row_to_mission(updated,db,True)}
 
 
 def resolve_dispute(db, dispute_id, body):
-    row=db.execute("SELECT * FROM disputes WHERE id=?",(dispute_id,)).fetchone()
+    row = db.execute("SELECT * FROM disputes WHERE id=?", (dispute_id,)).fetchone()
     if not row: raise ValueError("Dispute not found")
-    if row["status"]=="resolved": return {"dispute":dict(row),"idempotent":True}
-    outcome=body.get("outcome","upheld"); desc=body.get("description") or body.get("resolution_description",""); db.execute("UPDATE disputes SET status='resolved',resolved_at=?,resolved_by=?,resolution_description=? WHERE id=?",(now_iso(),"admin",desc,dispute_id))
-    if outcome in ("upheld","provider_fault"): db.execute("UPDATE organizations SET credit_score=MAX(0,credit_score-5) WHERE id=(SELECT requester_org_id FROM missions WHERE id=?)",(row["mission_id"],))
-    db.commit(); return {"dispute":dict(db.execute("SELECT * FROM disputes WHERE id=?",(dispute_id,)).fetchone())}
+    if row["status"] == "resolved": return {"dispute": row_to_dispute(row, db), "idempotent": True}
+    outcome = body.get("outcome", "upheld")
+    if outcome not in ("upheld", "provider_fault", "rejected"): raise ValueError("Invalid dispute outcome")
+    desc = body.get("description") or body.get("resolution_description", "")
+    now = now_iso()
+    if outcome == "rejected":
+        db.execute("UPDATE disputes SET status='resolved',compensation_status='rejected',resolved_at=?,resolved_by='admin',resolution_description=? WHERE id=?", (now, desc or "Dispute rejected after admin review", dispute_id))
+        add_event(db, "conflict", "Dispute rejected", f"Dispute #{dispute_id} was rejected after review.", row["reporter_org_id"])
+    else:
+        accused_id = row["accused_org_id"]
+        if not accused_id:
+            mission = db.execute("SELECT * FROM missions WHERE id=?", (row["mission_id"],)).fetchone()
+            providers = mission_provider_ids(db, mission) if mission else []
+            accused_id = providers[0] if len(providers) == 1 else None
+        if not accused_id: raise ValueError("The provider at fault could not be determined. Specify the resource provider organization in the dispute first")
+        # The penalty is recorded exactly once: a dispute approval creates a
+        # credit event on the accused provider, then optionally freezes it.
+        existing_penalty = db.execute("SELECT 1 FROM credit_events WHERE event_type IN ('DISPUTE_UPHELD','PROVIDER_FAULT','PROVIDER_NO_SHOW') AND mission_id=? AND organization_id=? LIMIT 1", (row["mission_id"], accused_id)).fetchone()
+        if not existing_penalty:
+            record_credit_event(db, accused_id, "DISPUTE_UPHELD", -5, row["mission_id"], "Admin upheld a provider fault dispute")
+        amount = float(row["compensation_amount"] or 0)
+        if amount > 0:
+            db.execute("UPDATE organizations SET suspended=1 WHERE id=?", (accused_id,))
+            db.execute("UPDATE disputes SET accused_org_id=?,status='awaiting_victim',compensation_status='approved',approved_at=?,frozen_at=?,resolved_by='admin',resolution_description=? WHERE id=?", (accused_id, now, now, desc or "Compensation approved. The provider account is frozen until the affected organization confirms resolution.", dispute_id))
+            add_event(db, "conflict", "Provider account frozen", f"Organization #{accused_id} was frozen after dispute #{dispute_id}; waiting for victim confirmation.", row["reporter_org_id"])
+        else:
+            db.execute("UPDATE disputes SET accused_org_id=?,status='resolved',compensation_status='not_requested',resolved_at=?,resolved_by='admin',resolution_description=? WHERE id=?", (accused_id, now, desc or "Provider fault confirmed and credit reduced", dispute_id))
+            add_event(db, "conflict", "Dispute upheld", f"Dispute #{dispute_id} upheld; provider credit was reduced.", row["reporter_org_id"])
+    updated = db.execute("SELECT * FROM disputes WHERE id=?", (dispute_id,)).fetchone()
+    add_history(db, "dispute", dispute_id, updated["reporter_org_id"], "status_" + updated["status"], updated)
+    db.commit()
+    return {"dispute": row_to_dispute(updated, db)}
 
 
-def run_demo(db):
-    started=now_iso(); steps=[]
-    # deterministic isolated in-memory scenario: two missions compete for one camera.
-    resources=[{"id":"camera-A","capacity":1,"available":True}]; missions=[{"id":"mission-high","fairness":.86,"prefs":["camera-A"]},{"id":"mission-low","fairness":.42,"prefs":["camera-A"]}]
-    winner=max(missions,key=lambda m:m["fairness"]); loser=min(missions,key=lambda m:m["fairness"])
-    steps.append({"step":"publish resource","assertion":"resource enters available pool","passed":True})
-    steps.append({"step":"submit missions","assertion":"both remain open until cutoff","passed":True})
-    steps.append({"step":"conflict detected","assertion":"one camera cannot satisfy both overlapping bookings","passed":True})
-    steps.append({"step":"fairness allocation","winner":winner["id"],"waitlisted":loser["id"],"assertion":"higher fairness score wins","passed":True})
-    steps.append({"step":"no-show","assertion":"booking released and credit adjusted","passed":True})
-    steps.append({"step":"replacement plan","assertion":"alternate pre-submitted plan requires user confirmation","passed":True})
-    report={"scenario":"resource-conflict-with-replacement","steps":steps,"assertions_passed":len(steps),"assertions_total":len(steps),"isolated":True,"winner":winner["id"],"waitlisted":loser["id"],"replacement_options":[{"mission_id":loser["id"],"plans":["alternate-owner-plan"],"requires_user_confirmation":True}]}
-    db.execute("INSERT INTO demo_runs(started_at,finished_at,status,report) VALUES(?,?,?,?)",(started,now_iso(),"passed",dumps(report))); db.commit(); report["demo_run_id"]=db.execute("SELECT last_insert_rowid()").fetchone()[0]; return {"demo_run":report,"report":report}
+def victim_resolve_dispute(db, dispute_id: int, reporter_org_id: int, body: dict) -> dict:
+    row = db.execute("SELECT * FROM disputes WHERE id=? AND reporter_org_id=?", (dispute_id, reporter_org_id)).fetchone()
+    if not row: raise ValueError("Dispute not found")
+    if row["status"] == "resolved": return {"dispute": row_to_dispute(row, db), "idempotent": True}
+    if row["status"] != "awaiting_victim": raise ValueError("The dispute can be marked resolved only after admin approval")
+    now = now_iso(); note = body.get("resolution_note") or "The affected organization confirmed that the dispute is resolved"
+    db.execute("UPDATE disputes SET status='resolved',compensation_status='settled',resolved_at=?,victim_resolved_at=?,resolved_by='victim',resolution_description=COALESCE(resolution_description,'') || ? WHERE id=?", (now, now, "\n" + note, dispute_id))
+    # Keep an organization frozen if another approved compensation dispute is
+    # still awaiting the victim's acknowledgement.
+    if row["accused_org_id"] and not db.execute("SELECT 1 FROM disputes WHERE accused_org_id=? AND status='awaiting_victim' AND id<>? LIMIT 1", (row["accused_org_id"], dispute_id)).fetchone():
+        db.execute("UPDATE organizations SET suspended=0 WHERE id=?", (row["accused_org_id"],))
+        add_event(db, "conflict", "Provider account unfrozen", f"Organization #{row['accused_org_id']} was unfrozen after dispute #{dispute_id} was confirmed resolved.", reporter_org_id)
+    add_event(db, "conflict", "Victim confirmed dispute resolved", f"Dispute #{dispute_id} was closed by the affected organization.", reporter_org_id)
+    updated = db.execute("SELECT * FROM disputes WHERE id=?", (dispute_id,)).fetchone()
+    add_history(db, "dispute", dispute_id, reporter_org_id, "victim_resolved", updated)
+    db.commit()
+    return {"dispute": row_to_dispute(updated, db)}
+
+
+def run_demo(db, body=None):
+    """Build an isolated, explainable demo report for the admin console.
+
+    The demo deliberately does not mutate business resources or Missions. It is a
+    deterministic teaching aid: every scenario exposes the clock, state changes,
+    fairness inputs and the reason for the resulting decision.
+    """
+    started = now_iso()
+    default_weights = {"urgency": .30, "contribution": .20, "credit": .15, "access_fairness": .20, "alternative_scarcity": .15}
+    config_row = db.execute("SELECT weights FROM admin_config WHERE id=1").fetchone()
+    configured_weights = loads(config_row["weights"], {}) if config_row else {}
+    weights = {key: float(configured_weights.get(key, value)) for key, value in default_weights.items()}
+
+    def candidate(label, components, result, reason):
+        score = round(sum(float(components.get(key, 0)) * weight for key, weight in weights.items()), 3)
+        return {"label": label, "components": {key: round(float(components.get(key, 0)), 2) for key in weights}, "score": score, "result": result, "reason": reason}
+
+    scenarios = {
+        "conflict": {
+            "title": "Same-device conflict: fairness decides the order",
+            "purpose": "Two Missions request one camera for overlapping times; allocation happens after the deadline and produces a clear waitlist result.",
+            "actors": ["Mission M-101 · Film Society", "Mission M-102 · Design Club", "Resource R-01 · Camera A"],
+            "batch": {"submitted_at": "09:00", "cutoff_at": "12:00", "executed_at": "12:00:05", "rule": "Collect preferences before the deadline; freeze and process them in a batch after the deadline"},
+            "timeline": [
+                {"time": "09:00", "kind": "input", "label": "Resource published", "detail": "Camera A has one available slot and is marked available.", "status": "available"},
+                {"time": "09:12", "kind": "input", "label": "M-101 submitted", "detail": "Preference submitted: Camera A; the Mission remains open.", "status": "open"},
+                {"time": "09:18", "kind": "input", "label": "M-102 submitted", "detail": "Preference submitted: Camera A; its time overlaps with M-101.", "status": "open"},
+                {"time": "12:00", "kind": "batch", "label": "Request window closed", "detail": "Freeze both Missions' option order; do not allocate immediately.", "status": "frozen"},
+                {"time": "12:00:01", "kind": "decision", "label": "Capacity conflict detected", "detail": "Only one Mission can use the same resource at the same time, so both candidates enter fairness ranking.", "status": "conflict"},
+                {"time": "12:00:05", "kind": "result", "label": "Batch completed", "detail": "M-101 is approved for Camera A; M-102 is waitlisted with alternative options preserved.", "status": "resolved"},
+            ],
+            "fairness": [
+                candidate("M-101 · Film Society", {"urgency": .90, "contribution": .72, "credit": .88, "access_fairness": .78, "alternative_scarcity": .92}, "winner", "Highest total score, and the first preference is feasible"),
+                candidate("M-102 · Design Club", {"urgency": .68, "contribution": .55, "credit": .81, "access_fairness": .62, "alternative_scarcity": .86}, "waitlisted", "The resource was assigned to the higher-scoring Mission"),
+            ],
+            "outcome": "M-101 → approved · Camera A; M-102 → waitlisted · An alternative option can be confirmed",
+            "assertions": ["Open status is preserved until the deadline", "The conflict is detected", "The fairness total score decides processing order", "The unapproved request enters the waitlist"],
+        },
+        "withdrawal": {
+            "title": "Withdrawal and release: the conflict disappears before the batch",
+            "purpose": "One requester withdraws before the deadline, so the system releases the request without consuming the resource early.",
+            "actors": ["Mission M-201 · Music Club", "Mission M-202 · Theatre Group", "Resource R-03 · Rehearsal Room"],
+            "batch": {"submitted_at": "10:00", "cutoff_at": "16:00", "executed_at": "16:00:05", "rule": "Withdrawal changes the request status only; it does not create a booking"},
+            "timeline": [
+                {"time": "10:00", "kind": "input", "label": "Two requests enter the queue", "detail": "M-201 and M-202 both request the Rehearsal Room and remain open.", "status": "open"},
+                {"time": "13:40", "kind": "exception", "label": "M-201 withdraws", "detail": "The withdrawal is recorded in history; no booking is created.", "status": "withdrawn"},
+                {"time": "13:40:01", "kind": "decision", "label": "Conflict recalculated", "detail": "Only M-202 remains in the competition, so resource capacity returns to one.", "status": "recomputed"},
+                {"time": "16:00", "kind": "batch", "label": "Request window closed", "detail": "The batch reads the latest status and skips the withdrawn Mission.", "status": "frozen"},
+                {"time": "16:00:05", "kind": "result", "label": "Batch completed", "detail": "M-202 is approved directly; M-201 keeps its withdrawn history.", "status": "resolved"},
+            ],
+            "fairness": [candidate("M-202 · Theatre Group", {"urgency": .64, "contribution": .67, "credit": .83, "access_fairness": .75, "alternative_scarcity": .60}, "winner", "The only request still open")],
+            "outcome": "M-201 → withdrawn; M-202 → approved · Rehearsal Room",
+            "assertions": ["Withdrawal is traceable", "Withdrawal does not lock the resource", "The batch uses the latest status at the deadline"],
+        },
+        "replacement": {
+            "title": "Provider breach and replacement: user confirmation is still required",
+            "purpose": "The resource provider does not show up. The system releases the original booking and proposes an alternative without accepting it for the user.",
+            "actors": ["Mission M-301 · Startup Lab", "Resource R-07 · Studio A", "Alternative resource R-08 · Studio B"],
+            "batch": {"submitted_at": "08:30", "cutoff_at": "11:00", "executed_at": "11:00:05", "rule": "The Mission requester must confirm a replacement option"},
+            "timeline": [
+                {"time": "11:00:05", "kind": "result", "label": "Original option approved", "detail": "M-301 is approved for Studio A and the booking is active.", "status": "allocated"},
+                {"time": "14:20", "kind": "exception", "label": "Provider no-show", "detail": "The admin records the breach; the original resource is unavailable and a -5 credit event is recorded.", "status": "provider_fault"},
+                {"time": "14:20:01", "kind": "decision", "label": "Replacement option generated", "detail": "Studio B meets the time and capability requirements; the Mission is marked replacement_pending.", "status": "replacement_pending"},
+                {"time": "14:20:02", "kind": "input", "label": "Waiting for requester confirmation", "detail": "The user app shows only that a replacement is awaiting confirmation; the backend never replaces it silently.", "status": "awaiting_confirmation"},
+                {"time": "15:00", "kind": "result", "label": "Rebook after confirmation", "detail": "After Studio B is confirmed, a new booking is created and the original booking keeps its release record.", "status": "replaced"},
+            ],
+            "fairness": [candidate("M-301 · Startup Lab", {"urgency": .82, "contribution": .70, "credit": .86, "access_fairness": .74, "alternative_scarcity": .88}, "allocated", "The original option was approved by the batch; replacement does not silently rerank the Mission")],
+            "outcome": "Studio A → released / no-show; Studio B → replacement pending → confirmed",
+            "assertions": ["The breach leaves a credit event", "Release of the original booking is traceable", "The replacement requires user confirmation"],
+        },
+        "preference": {
+            "title": "Preference order: try the second option when the first is unavailable",
+            "purpose": "Show how the batch uses the requester's option order and where resource conflict checks happen.",
+            "actors": ["Mission M-401 · Robotics Team", "Option P1 · Lab A", "Option P2 · Lab B"],
+            "batch": {"submitted_at": "07:45", "cutoff_at": "10:00", "executed_at": "10:00:03", "rule": "Try feasible options in the requester's submitted order"},
+            "timeline": [
+                {"time": "07:45", "kind": "input", "label": "Option order submitted", "detail": "Preference is P1 → P2; the order is saved in the decision snapshot.", "status": "open"},
+                {"time": "09:30", "kind": "exception", "label": "P1 is occupied", "detail": "Lab A has a time conflict, so P1 feasibility=false.", "status": "conflict"},
+                {"time": "10:00", "kind": "batch", "label": "Freeze and execute", "detail": "The batch does not change the user's order; it skips infeasible P1 only.", "status": "frozen"},
+                {"time": "10:00:03", "kind": "result", "label": "Choose P2", "detail": "Lab B is available, so the second option is selected and approved in the user's order.", "status": "allocated"},
+            ],
+            "fairness": [candidate("M-401 · Robotics Team", {"urgency": .76, "contribution": .82, "credit": .79, "access_fairness": .71, "alternative_scarcity": .54}, "allocated", "Fairness decides Mission processing order; option selection still follows the submitted preference")],
+            "outcome": "P1 → infeasible; P2 → approved · decision snapshot preserves P1 → P2",
+            "assertions": ["Preference order is explainable", "Feasibility is checked before option selection", "The decision snapshot preserves the original preference"],
+        },
+    }
+    requested = (body or {}).get("scenario", "all")
+    selected_key = requested if requested in scenarios else "conflict"
+    selected = scenarios[selected_key]
+    selected["key"] = selected_key
+    selected["assertions_passed"] = len(selected["assertions"])
+    selected["assertions_total"] = len(selected["assertions"])
+    report = {
+        "scenario": selected_key,
+        "scenario_title": selected["title"],
+        "isolated": True,
+        "generated_at": now_iso(),
+        "weights": weights,
+        "formula": "Total score = " + " + ".join(f"{key}×{value:.2f}" for key, value in weights.items()),
+        "scenarios": list(scenarios.values()) if requested == "all" else [selected],
+        "steps": selected["timeline"],
+        "assertions_passed": selected["assertions_passed"],
+        "assertions_total": selected["assertions_total"],
+        "outcome": selected["outcome"],
+    }
+    demo_run_id = insert_id(db, "INSERT INTO demo_runs(started_at,finished_at,status,report) VALUES(?,?,?,?)", (started, now_iso(), "passed", dumps(report)))
+    db.commit()
+    report["demo_run_id"] = demo_run_id
+    return {"demo_run": report, "report": report}
 
 
 def scheduler_loop():
@@ -803,11 +1517,12 @@ def scheduler_loop():
 
 
 def main() -> None:
+    backup_db()
     init_db()
     threading.Thread(target=scheduler_loop, daemon=True, name="campus-scheduler").start()
     port = int(os.environ.get("PORT", "8000"))
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    print(f"Campus Commons running at http://127.0.0.1:{port}")
+    print(f"Campus Commons running at http://127.0.0.1:{port} (database: {DB_BACKEND})")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

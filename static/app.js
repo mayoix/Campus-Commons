@@ -1,5 +1,7 @@
 /* Campus Commons user client. */
 const state = { data: null, view: 'overview', mission: null };
+let userSyncTimer = null;
+let userSyncBusy = false;
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -10,15 +12,15 @@ const fmtDate = value => {
   if (!value) return '—';
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return '—';
-  return `${date.toLocaleDateString('zh-HK', { month: 'short', day: 'numeric' })} ${date.toLocaleTimeString('zh-HK', { hour: '2-digit', minute: '2-digit' })}`;
+  return `${date.toLocaleDateString('en-HK', { month: 'short', day: 'numeric' })} ${date.toLocaleTimeString('en-HK', { hour: '2-digit', minute: '2-digit' })}`;
 };
 const fmtRelative = value => {
-  if (!value) return '时间待定';
+  if (!value) return 'Time not set';
   const delta = new Date(value).getTime() - Date.now();
-  if (!Number.isFinite(delta)) return '时间待定';
-  if (delta < 0) return '已到时间';
+  if (!Number.isFinite(delta)) return 'Time not set';
+  if (delta < 0) return 'Due now';
   const hours = Math.round(delta / 36e5);
-  return hours < 24 ? `${hours} 小时后` : `${Math.round(hours / 24)} 天后`;
+  return hours < 24 ? `${hours} hours` : `${Math.round(hours / 24)} days`;
 };
 const localInput = value => {
   const date = value ? new Date(value) : new Date();
@@ -31,7 +33,7 @@ async function api(path, options = {}) {
   const response = await fetch(path, { credentials: 'same-origin', ...options, headers: { 'Content-Type': 'application/json', ...(options.headers || {}) } });
   let body = {};
   try { body = await response.json(); } catch (_) { /* empty response */ }
-  if (!response.ok) throw new Error(body.error || body.message || '请求失败，请稍后重试');
+  if (!response.ok) throw new Error(body.error || body.message || 'Request failed. Please try again.');
   return body;
 }
 function toast(message, bad = false) {
@@ -46,16 +48,17 @@ function toast(message, bad = false) {
 function org() { return state.data?.organization || {}; }
 function ownResource(resource) { return Number(resource.owner_org_id) === Number(org().id); }
 function missionStatus(status) {
-  const labels = { open: '申请中', waitlisted: '候补中', allocated: '已获批', frozen: '已获批', in_use: '使用中', completed: '已完成', withdrawn: '已取消', replacement_pending: '待替换' };
+  const labels = { open: 'Open', waitlisted: 'Waitlisted', allocated: 'Approved', frozen: 'Approved', in_use: 'In use', completed: 'Completed', withdrawn: 'Cancelled', replacement_pending: 'Replacement pending' };
   return labels[status] || status || '—';
 }
 function statusTag(status) { return `<span class="mission-status status-${esc(status || 'unknown')}">${esc(missionStatus(status))}</span>`; }
+function disputeStatus(status) { return ({ open: 'Pending admin review', awaiting_victim: 'Approved · waiting for requester confirmation', resolved: 'Resolved', rejected: 'Rejected' }[status] || status || 'Processing'); }
 function resourceStatus(status) {
-  const labels = { available: '可申请', offline: '暂不可用', maintenance: '维护中', reserved: '已有预约' };
+  const labels = { available: 'Available', offline: 'Unavailable', maintenance: 'Under maintenance', reserved: 'Reserved' };
   return labels[status] || status || '—';
 }
 function resourceStatusClass(status) { return status === 'available' ? 'green' : status === 'maintenance' ? 'orange' : 'purple'; }
-function typeLabel(type) { return ({ equipment: '设备', skill: '技能', space: '场地', people: '人力' }[type] || type || '资源'); }
+function typeLabel(type) { return ({ equipment: 'Equipment', skill: 'Skill', space: 'Space', people: 'People' }[type] || type || 'Resource'); }
 function statusCounts(missions) { return missions.reduce((result, item) => { result[item.status] = (result[item.status] || 0) + 1; return result; }, {}); }
 
 function navSetup() {
@@ -66,7 +69,7 @@ function setView(view) {
   state.view = view;
   $$('.view').forEach(section => section.classList.toggle('active', section.id === `view-${view}`));
   $$('.nav-item').forEach(button => button.classList.toggle('active', button.dataset.view === view));
-  const labels = { overview: '总览', missions: 'Mission', resources: '资源池', profile: '组织档案' };
+  const labels = { overview: 'Overview', missions: 'Mission', resources: 'Resources', profile: 'Organization profile' };
   $('#page-label').textContent = labels[view];
   renderView();
 }
@@ -86,18 +89,18 @@ function renderOverview() {
   const availableHours = num(org().available_hours);
   const events = arr(data.events).slice(0, 5);
   $('#view-overview').innerHTML = `
-    <div class="view-heading"><div><div class="eyebrow">组织工作台 · ${esc(org().short_name || org().name)}</div><h1>让闲置能力，流动起来。</h1><p>这里显示 ${esc(org().short_name || '本组织')} 的 Mission、资源和通知。</p></div><button class="primary-btn" id="new-mission" type="button">+ 提交新 Mission</button></div>
+    <div class="view-heading"><div><div class="eyebrow">Organization workspace · ${esc(org().short_name || org().name)}</div><h1>Put unused resources to work.</h1><p>This is where you can see ${esc(org().short_name || 'this organization')}'s Missions, resources, and notifications.</p></div><button class="primary-btn" id="new-mission" type="button">+ Submit a Mission</button></div>
     <div class="stat-grid">
-      <div class="stat-card"><div class="stat-top"><span>我的资源</span><span class="stat-icon green" aria-hidden="true">▦</span></div><div class="stat-value">${mine.length}</div><div class="stat-foot">其中 ${mine.filter(r => r.status === 'available').length} 个可申请</div></div>
-      <div class="stat-card"><div class="stat-top"><span>我的 Mission</span><span class="stat-icon blue" aria-hidden="true">◎</span></div><div class="stat-value">${missions.length}</div><div class="stat-foot">${counts.allocated || 0} 个已获批</div></div>
-      <div class="stat-card"><div class="stat-top"><span>信用分</span><span class="stat-icon purple" aria-hidden="true">◇</span></div><div class="stat-value">${credit === null ? '—' : Math.round(credit)}</div><div class="stat-foot">平台记录的组织信用</div></div>
-      <div class="stat-card"><div class="stat-top"><span>共享时长</span><span class="stat-icon orange" aria-hidden="true">◷</span></div><div class="stat-value">${sharedHours === null ? '—' : sharedHours}<small style="font-size:14px;color:#788983">${sharedHours === null ? '' : 'h'}</small></div><div class="stat-foot">可验证时长 ${availableHours === null ? '—' : `${availableHours}h`}</div></div>
+      <div class="stat-card"><div class="stat-top"><span>My resources</span><span class="stat-icon green" aria-hidden="true">▦</span></div><div class="stat-value">${mine.length}</div><div class="stat-foot">of which ${mine.filter(r => r.status === 'available').length} available</div></div>
+      <div class="stat-card"><div class="stat-top"><span>My Missions</span><span class="stat-icon blue" aria-hidden="true">◎</span></div><div class="stat-value">${missions.length}</div><div class="stat-foot">${counts.allocated || 0} approved</div></div>
+      <div class="stat-card"><div class="stat-top"><span>Credit score</span><span class="stat-icon purple" aria-hidden="true">◇</span></div><div class="stat-value">${credit === null ? '—' : Math.round(credit)}</div><div class="stat-foot">Platform-recorded organization credit</div></div>
+      <div class="stat-card"><div class="stat-top"><span>Shared hours</span><span class="stat-icon orange" aria-hidden="true">◷</span></div><div class="stat-value">${sharedHours === null ? '—' : sharedHours}<small style="font-size:14px;color:#788983">${sharedHours === null ? '' : 'h'}</small></div><div class="stat-foot">Verified availability ${availableHours === null ? '—' : `${availableHours}h`}</div></div>
     </div>
     <div class="grid-2">
-      <div class="panel"><div class="panel-head"><div><h2>我的 Mission</h2><small>只显示本组织提交的申请</small></div><button class="text-link" id="go-missions" type="button">查看全部 →</button></div><div class="mission-list">${missions.length ? missions.slice(0, 5).map(missionRow).join('') : '<div class="empty">还没有 Mission</div>'}</div></div>
-      <div class="panel"><div class="panel-head"><div><h2>最近活动</h2><small>与本组织相关的通知</small></div><button class="text-link" id="go-activity" type="button">查看全部 →</button></div><div class="activity-list">${events.length ? events.map(eventRow).join('') : '<div class="empty">暂无通知</div>'}</div></div>
+      <div class="panel"><div class="panel-head"><div><h2>My Missions</h2><small>Only Missions submitted by this organization</small></div><button class="text-link" id="go-missions" type="button">View all →</button></div><div class="mission-list">${missions.length ? missions.slice(0, 5).map(missionRow).join('') : '<div class="empty">No Missions yet</div>'}</div></div>
+      <div class="panel"><div class="panel-head"><div><h2>Recent activity</h2><small>Notifications for this organization</small></div><button class="text-link" id="go-activity" type="button">View all →</button></div><div class="activity-list">${events.length ? events.map(eventRow).join('') : '<div class="empty">No notifications yet</div>'}</div></div>
     </div>
-    <div class="panel contribution-panel"><div class="panel-head"><div><h2>组织贡献</h2><small>资源共享和 Mission 完成记录</small></div><button class="secondary-btn" id="go-profile" type="button">查看组织档案</button></div><div class="contribution-grid"><div><span>信用分</span><strong>${credit === null ? '—' : `${Math.round(credit)} / 100`}</strong></div><div><span>实际共享</span><strong>${sharedHours === null ? '—' : `${sharedHours}h`}</strong></div><div><span>可验证可用时间</span><strong>${availableHours === null ? '—' : `${availableHours}h`}</strong></div><div><span>成功完成 Mission</span><strong>${dash(org().allocations_won)}</strong></div></div></div>`;
+    <div class="panel contribution-panel"><div class="panel-head"><div><h2>Organization contribution</h2><small>Resource sharing and completed Missions</small></div><button class="secondary-btn" id="go-profile" type="button">View organization profile</button></div><div class="contribution-grid"><div><span>Credit score</span><strong>${credit === null ? '—' : `${Math.round(credit)} / 100`}</strong></div><div><span>Hours shared</span><strong>${sharedHours === null ? '—' : `${sharedHours}h`}</strong></div><div><span>Verified available hours</span><strong>${availableHours === null ? '—' : `${availableHours}h`}</strong></div><div><span>Missions completed</span><strong>${dash(org().allocations_won)}</strong></div></div></div>`;
   $('#new-mission').onclick = openMissionModal;
   $('#go-missions').addEventListener('click', () => setView('missions'));
   $('#go-profile').addEventListener('click', () => setView('profile'));
@@ -106,21 +109,21 @@ function renderOverview() {
 }
 function missionRow(mission) {
   const score = num(mission.fairness?.score);
-  return `<button class="mission-row" data-id="${esc(mission.id)}" type="button"><div class="mission-badge">${['allocated', 'frozen', 'in_use', 'completed'].includes(mission.status) ? '✓' : 'M'}</div><div><div class="mission-title">${esc(mission.title)}</div><div class="mission-meta">${fmtRelative(mission.deadline)} · ${arr(mission.plans).length} 个可选方案</div></div>${statusTag(mission.status)}${score === null ? '' : `<span class="score">${Math.round(score * 100)}</span>`}<span class="chevron" aria-hidden="true">›</span></button>`;
+  return `<button class="mission-row" data-id="${esc(mission.id)}" type="button"><div class="mission-badge">${['allocated', 'frozen', 'in_use', 'completed'].includes(mission.status) ? '✓' : 'M'}</div><div><div class="mission-title">${esc(mission.title)}</div><div class="mission-meta">${fmtRelative(mission.deadline)} · ${arr(mission.plans).length} options</div></div>${statusTag(mission.status)}${score === null ? '' : `<span class="score">${Math.round(score * 100)}</span>`}<span class="chevron" aria-hidden="true">›</span></button>`;
 }
-function eventRow(event) { return `<div class="activity"><div class="activity-line" aria-hidden="true"></div><div><strong>${esc(event.title || '平台通知')}</strong><small>${esc(event.detail || '')}</small><time>${fmtDate(event.created_at)}</time></div></div>`; }
+function eventRow(event) { return `<div class="activity"><div class="activity-line" aria-hidden="true"></div><div><strong>${esc(event.title || 'Platform notification')}</strong><small>${esc(event.detail || '')}</small><time>${fmtDate(event.created_at)}</time></div></div>`; }
 
 function renderMissions() {
   const missions = arr(state.data.missions);
-  const filters = [['all', '全部'], ['open', '申请中'], ['waitlisted', '候补中'], ['allocated', '已获批'], ['in_use', '使用中'], ['completed', '已完成'], ['withdrawn', '已取消']];
-  $('#view-missions').innerHTML = `<div class="view-heading"><div><div class="eyebrow">Mission</div><h1>提交和管理你的需求。</h1><p>在申请截止前选择可接受方案；获批后可以开始使用并完成归还。</p></div><button class="primary-btn" id="new-mission" type="button">+ 提交新 Mission</button></div><div class="filter-row">${filters.map(([key, label]) => `<button class="filter-btn ${key === 'all' ? 'active' : ''}" data-filter="${key}" type="button">${label} ${key === 'all' ? missions.length : missions.filter(m => m.status === key).length}</button>`).join('')}</div><div id="mission-cards">${missions.length ? missions.map(missionCard).join('') : '<div class="panel"><div class="empty">还没有 Mission。提交一个需求开始匹配资源。</div></div>'}</div>`;
+  const filters = [['all', 'All'], ['open', 'Open'], ['waitlisted', 'Waitlisted'], ['allocated', 'Approved'], ['in_use', 'In use'], ['completed', 'Completed'], ['withdrawn', 'Cancelled']];
+  $('#view-missions').innerHTML = `<div class="view-heading"><div><div class="eyebrow">Mission</div><h1>Submit and manage your needs.</h1><p>Choose acceptable options before the deadline. After approval, you can check out and return the resource.</p></div><button class="primary-btn" id="new-mission" type="button">+ Submit a Mission</button></div><div class="filter-row">${filters.map(([key, label]) => `<button class="filter-btn ${key === 'all' ? 'active' : ''}" data-filter="${key}" type="button">${label} ${key === 'all' ? missions.length : missions.filter(m => m.status === key).length}</button>`).join('')}</div><div id="mission-cards">${missions.length ? missions.map(missionCard).join('') : '<div class="panel"><div class="empty">No Missions yet. Submit a request to start matching resources.</div></div>'}</div>`;
   $('#new-mission').onclick = openMissionModal;
-  $$('.filter-btn').forEach(button => button.addEventListener('click', () => { $$('.filter-btn').forEach(item => item.classList.remove('active')); button.classList.add('active'); const key = button.dataset.filter; $('#mission-cards').innerHTML = missions.filter(m => key === 'all' || m.status === key).map(missionCard).join('') || '<div class="panel"><div class="empty">暂无符合条件的 Mission</div></div>'; bindMissionCards(); }));
+  $$('.filter-btn').forEach(button => button.addEventListener('click', () => { $$('.filter-btn').forEach(item => item.classList.remove('active')); button.classList.add('active'); const key = button.dataset.filter; $('#mission-cards').innerHTML = missions.filter(m => key === 'all' || m.status === key).map(missionCard).join('') || '<div class="panel"><div class="empty">No Missions match this filter</div></div>'; bindMissionCards(); }));
   bindMissionCards();
 }
 function missionCard(mission) {
   const score = num(mission.fairness?.score);
-  return `<article class="mission-card"><div class="mission-card-head"><div class="mission-badge">${['allocated', 'frozen', 'in_use', 'completed'].includes(mission.status) ? '✓' : 'M'}</div><div><h3>${esc(mission.title)}</h3><p>${esc(mission.description)}</p><div class="mission-card-meta"><span>◷ ${fmtDate(mission.start_at)}</span><span>⌖ ${esc(mission.location)}</span><span>▣ ${arr(mission.requirements).length} 项要求</span></div></div>${statusTag(mission.status)}</div><div class="mission-card-actions"><span class="tag ${arr(mission.plans).length ? 'green' : ''}">${arr(mission.plans).length} 个可选方案${score === null ? '' : ` · 公平分数 ${Math.round(score * 100)}`}</span><button class="secondary-btn" data-open-mission="${esc(mission.id)}" type="button">查看详情 →</button></div></article>`;
+  return `<article class="mission-card"><div class="mission-card-head"><div class="mission-badge">${['allocated', 'frozen', 'in_use', 'completed'].includes(mission.status) ? '✓' : 'M'}</div><div><h3>${esc(mission.title)}</h3><p>${esc(mission.description)}</p><div class="mission-card-meta"><span>◷ ${fmtDate(mission.start_at)}</span><span>⌖ ${esc(mission.location)}</span><span>▣ ${arr(mission.requirements).length} requirements</span></div></div>${statusTag(mission.status)}</div><div class="mission-card-actions"><span class="tag ${arr(mission.plans).length ? 'green' : ''}">${arr(mission.plans).length} options${score === null ? '' : ` · fairness score ${Math.round(score * 100)}`}</span><button class="secondary-btn" data-open-mission="${esc(mission.id)}" type="button">View details →</button></div></article>`;
 }
 function bindMissionCards() { $$('[data-open-mission]').forEach(button => button.addEventListener('click', () => openMissionDetail(button.dataset.openMission))); }
 
@@ -128,35 +131,55 @@ function resourceSort(resources, mode) {
   const statusOrder = { available: 0, offline: 1, maintenance: 2, reserved: 3 };
   return [...resources].sort((a, b) => {
     if (mode === 'time') return (new Date(a.availability_start || 0) - new Date(b.availability_start || 0)) || String(a.name).localeCompare(String(b.name));
-    if (mode === 'location') return String(a.location || '').localeCompare(String(b.location || ''), 'zh-Hans', { sensitivity: 'base' }) || String(a.name).localeCompare(String(b.name));
+    if (mode === 'location') return String(a.location || '').localeCompare(String(b.location || ''), 'en', { sensitivity: 'base' }) || String(a.name).localeCompare(String(b.name));
     if (mode === 'price') return (num(a.hourly_value) ?? Infinity) - (num(b.hourly_value) ?? Infinity) || String(a.name).localeCompare(String(b.name));
     return (statusOrder[a.status] ?? 9) - (statusOrder[b.status] ?? 9) || String(a.name).localeCompare(String(b.name));
   });
 }
 function resourceRows(resources) {
-  return resources.map(resource => `<tr><td><strong>${esc(resource.name)}</strong><small>${esc(resource.features || resource.capability || '')}</small></td><td><span class="tag blue">${esc(typeLabel(resource.type))}</span></td><td>${esc(resource.owner_name || resource.owner_short_name || '')}</td><td>${fmtDate(resource.availability_start)}<br><span class="subtle">至 ${fmtDate(resource.availability_end)}</span></td><td>${esc(resource.location || '—')}</td><td><span class="tag ${resourceStatusClass(resource.status)}">${esc(resourceStatus(resource.status))}</span></td><td>${num(resource.hourly_value) === null ? '—' : `$${num(resource.hourly_value)}`} ${ownResource(resource) ? `<button class="edit-resource-link" data-edit-resource="${esc(resource.id)}" type="button">编辑</button>` : ''}</td></tr>`).join('');
+  return resources.map(resource => `<tr><td><strong>${esc(resource.name)}</strong><small>${esc(resource.features || resource.capability || '')}</small></td><td><span class="tag blue">${esc(typeLabel(resource.type))}</span></td><td>${esc(resource.owner_name || resource.owner_short_name || '')}</td><td>${fmtDate(resource.availability_start)}<br><span class="subtle">to ${fmtDate(resource.availability_end)}</span></td><td>${esc(resource.location || '—')}</td><td><span class="tag ${resourceStatusClass(resource.status)}">${esc(resourceStatus(resource.status))}</span></td><td>${num(resource.hourly_value) === null ? '—' : `$${num(resource.hourly_value)}`} ${ownResource(resource) ? `<button class="edit-resource-link" data-edit-resource="${esc(resource.id)}" type="button">Edit</button>` : ''}</td></tr>`).join('');
 }
 function renderResources() {
   const resources = arr(state.data.resources);
   const own = resources.filter(ownResource);
-  $('#view-resources').innerHTML = `<div class="view-heading"><div><div class="eyebrow">共享资源池</div><h1>找到可以使用的资源。</h1><p>按状态、可用时间、位置或价格排序。你上架的资源可以在组织档案中编辑。</p></div><button class="primary-btn" id="new-resource" type="button">+ 开放资源</button></div><div class="stat-grid"><div class="stat-card"><div class="stat-top"><span>可申请资源</span><span class="stat-icon green" aria-hidden="true">▦</span></div><div class="stat-value">${resources.filter(r => r.status === 'available').length}</div><div class="stat-foot">来自共享网络</div></div><div class="stat-card"><div class="stat-top"><span>我的资源</span><span class="stat-icon blue" aria-hidden="true">◌</span></div><div class="stat-value">${own.length}</div><div class="stat-foot">可在组织档案管理</div></div><div class="stat-card"><div class="stat-top"><span>我的可用资源</span><span class="stat-icon purple" aria-hidden="true">✓</span></div><div class="stat-value">${own.filter(r => r.status === 'available').length}</div><div class="stat-foot">状态由组织维护</div></div></div><div class="panel table-panel"><div class="panel-head"><div><h2>资源目录</h2><small>公共资源可浏览；只有自己的资源显示编辑入口</small></div><label class="sort-label" for="resource-sort">排序<select id="resource-sort" class="resource-sort"><option value="status">状态排序</option><option value="time">可用时间：早 → 晚</option><option value="location">位置：A → Z</option><option value="price">价格：低 → 高</option></select></label></div><div class="table-scroll"><table class="data-table"><thead><tr><th>资源</th><th>类型</th><th>提供组织</th><th>可用时间</th><th>位置</th><th>状态</th><th>价值 / h</th></tr></thead><tbody id="resource-table-body">${resourceRows(resourceSort(resources, 'status')) || '<tr><td colspan="7"><div class="empty">暂无资源</div></td></tr>'}</tbody></table></div></div>`;
+  $('#view-resources').innerHTML = `<div class="view-heading"><div><div class="eyebrow">Shared resource pool</div><h1>Find resources you can use.</h1><p>Sort by status, availability, location, or price. You can edit resources you publish from your organization profile.</p></div><button class="primary-btn" id="new-resource" type="button">+ Publish resource</button></div><div class="stat-grid"><div class="stat-card"><div class="stat-top"><span>Available resources</span><span class="stat-icon green" aria-hidden="true">▦</span></div><div class="stat-value">${resources.filter(r => r.status === 'available').length}</div><div class="stat-foot">Across the shared network</div></div><div class="stat-card"><div class="stat-top"><span>My resources</span><span class="stat-icon blue" aria-hidden="true">◌</span></div><div class="stat-value">${own.length}</div><div class="stat-foot">Manage from your profile</div></div><div class="stat-card"><div class="stat-top"><span>My available resources</span><span class="stat-icon purple" aria-hidden="true">✓</span></div><div class="stat-value">${own.filter(r => r.status === 'available').length}</div><div class="stat-foot">Maintained by the owning organization</div></div></div><div class="panel table-panel"><div class="panel-head"><div><h2>Resource directory</h2><small>Browse shared resources; edit controls appear only for your own resources</small></div><label class="sort-label" for="resource-sort">Sort<select id="resource-sort" class="resource-sort"><option value="status">Sort by status</option><option value="time">Availability: earliest first</option><option value="location">Location: A to Z</option><option value="price">Price: low to high</option></select></label></div><div class="table-scroll"><table class="data-table"><thead><tr><th>Resource</th><th>Type</th><th>Provider</th><th>Available time</th><th>Location</th><th>Status</th><th>Value / hour</th></tr></thead><tbody id="resource-table-body">${resourceRows(resourceSort(resources, 'status')) || '<tr><td colspan="7"><div class="empty">No resources</div></td></tr>'}</tbody></table></div></div>`;
   $('#new-resource').addEventListener('click', () => openResourceModal());
-  $('#resource-sort').addEventListener('change', event => { $('#resource-table-body').innerHTML = resourceRows(resourceSort(resources, event.target.value)) || '<tr><td colspan="7"><div class="empty">暂无资源</div></td></tr>'; bindResourceLinks(); });
+  $('#resource-sort').addEventListener('change', event => { $('#resource-table-body').innerHTML = resourceRows(resourceSort(resources, event.target.value)) || '<tr><td colspan="7"><div class="empty">No resources</div></td></tr>'; bindResourceLinks(); });
   bindResourceLinks();
 }
 function bindResourceLinks() { $$('[data-edit-resource]').forEach(button => button.addEventListener('click', () => openResourceModal(button.dataset.editResource))); }
 
+function historyEntityLabel(type) { return ({ resource: 'Resource', mission: 'Mission', dispute: 'Dispute', organization: 'Organization', platform: 'Platform' }[type] || type || 'Record'); }
+function historyActionLabel(action, snapshot) {
+  if (action === 'created') return 'Created';
+  if (action === 'updated') return 'Updated';
+  if (action === 'preferences_updated') return 'Updated option preferences';
+  if (action === 'replacement_pending') return 'Waiting for replacement';
+  if (action === 'config_updated') return 'Updated platform settings';
+  if (action.startsWith('status_')) return `Status: ${missionStatus(action.slice(7))}`;
+  if (action === 'resolved') return 'Processed';
+  return action || 'Change';
+}
+function historyLabel(item) {
+  const snapshot = item.snapshot || {};
+  return snapshot.title || snapshot.name || `${historyEntityLabel(item.entity_type)} #${item.entity_id}`;
+}
+function historyRows(history) {
+  return arr(history).slice(0, 50).map(item => `<tr><td><strong>${esc(historyLabel(item))}</strong><small>${esc(historyEntityLabel(item.entity_type))}</small></td><td>${esc(historyActionLabel(item.action, item.snapshot))}</td><td>${fmtDate(item.created_at)}</td></tr>`).join('');
+}
+
 function renderProfile() {
   const mine = arr(state.data.resources).filter(ownResource);
   const credit = num(org().credit_score);
-  $('#view-profile').innerHTML = `<div class="view-heading"><div><div class="eyebrow">组织档案</div><h1>${esc(org().name || org().short_name || '我的组织')}</h1><p>${esc(org().kind || '共享网络成员')} · 这里管理本组织已上架的资源。</p></div><button class="primary-btn" id="profile-new-resource" type="button">+ 开放资源</button></div><div class="profile-grid profile-page-stats"><div class="profile-stat"><strong>${credit === null ? '—' : Math.round(credit)}</strong><small>信用分 / 100</small></div><div class="profile-stat"><strong>${dash(org().shared_hours)}${org().shared_hours === undefined ? '' : 'h'}</strong><small>实际共享时长</small></div><div class="profile-stat"><strong>${dash(org().available_hours)}${org().available_hours === undefined ? '' : 'h'}</strong><small>可验证可用时长</small></div><div class="profile-stat"><strong>${dash(org().allocations_won)}</strong><small>成功完成 Mission</small></div></div><div class="panel table-panel profile-resources"><div class="panel-head"><div><h2>我的资源</h2><small>修改名称、能力、时间、状态等信息</small></div><span class="tag blue">${mine.length} 项</span></div><div class="table-scroll"><table class="data-table"><thead><tr><th>资源</th><th>类型</th><th>能力 / 特征</th><th>时间</th><th>状态</th><th>操作</th></tr></thead><tbody>${mine.length ? mine.map(profileResourceRow).join('') : '<tr><td colspan="6"><div class="empty">还没有上架资源</div></td></tr>'}</tbody></table></div></div>`;
+  const history = arr(state.data.history);
+  $('#view-profile').innerHTML = `<div class="view-heading"><div><div class="eyebrow">Organization profile</div><h1>${esc(org().name || org().short_name || 'My organization')}</h1><p>${esc(org().kind || 'Shared network member')} · Manage resources published by this organization.</p></div><button class="primary-btn" id="profile-new-resource" type="button">+ Publish resource</button></div><div class="profile-grid profile-page-stats"><div class="profile-stat"><strong>${credit === null ? '—' : Math.round(credit)}</strong><small>Credit score / 100</small></div><div class="profile-stat"><strong>${dash(org().shared_hours)}${org().shared_hours === undefined ? '' : 'h'}</strong><small>Hours shared</small></div><div class="profile-stat"><strong>${dash(org().available_hours)}${org().available_hours === undefined ? '' : 'h'}</strong><small>Verified available hours</small></div><div class="profile-stat"><strong>${dash(org().allocations_won)}</strong><small>Missions completed</small></div></div><div class="panel table-panel profile-resources"><div class="panel-head"><div><h2>My resources</h2><small>Edit the name, capabilities, schedule, and status</small></div><span class="tag blue">${mine.length} items</span></div><div class="table-scroll"><table class="data-table"><thead><tr><th>Resource</th><th>Type</th><th>Capabilities / details</th><th>Time</th><th>Status</th><th>Actions</th></tr></thead><tbody>${mine.length ? mine.map(profileResourceRow).join('') : '<tr><td colspan="6"><div class="empty">No published resources yet</div></td></tr>'}</tbody></table></div></div><div class="panel table-panel history-panel"><div class="panel-head"><div><h2>History</h2><small>Resources and Missions created or updated by this organization are kept in the database</small></div><span class="tag blue">${history.length} records</span></div><div class="table-scroll"><table class="data-table"><thead><tr><th>Item</th><th>Change</th><th>Time</th></tr></thead><tbody>${historyRows(history) || '<tr><td colspan="3"><div class="empty">No history yet</div></td></tr>'}</tbody></table></div></div>`;
   $('#profile-new-resource').addEventListener('click', () => openResourceModal());
   $$('[data-edit-resource]', $('#view-profile')).forEach(button => button.addEventListener('click', () => openResourceModal(button.dataset.editResource)));
 }
-function profileResourceRow(resource) { return `<tr><td><strong>${esc(resource.name)}</strong><small>${esc(resource.location || '—')}</small></td><td>${esc(typeLabel(resource.type))}</td><td>${esc(resource.capability || '—')}<small>${esc(resource.features || '')}</small></td><td>${fmtDate(resource.availability_start)}<br><span class="subtle">至 ${fmtDate(resource.availability_end)}</span></td><td><span class="tag ${resourceStatusClass(resource.status)}">${esc(resourceStatus(resource.status))}</span></td><td><button class="secondary-btn compact" data-edit-resource="${esc(resource.id)}" type="button">编辑</button></td></tr>`; }
+function profileResourceRow(resource) { return `<tr><td><strong>${esc(resource.name)}</strong><small>${esc(resource.location || '—')}</small></td><td>${esc(typeLabel(resource.type))}</td><td>${esc(resource.capability || '—')}<small>${esc(resource.features || '')}</small></td><td>${fmtDate(resource.availability_start)}<br><span class="subtle">to ${fmtDate(resource.availability_end)}</span></td><td><span class="tag ${resourceStatusClass(resource.status)}">${esc(resourceStatus(resource.status))}</span></td><td><button class="secondary-btn compact" data-edit-resource="${esc(resource.id)}" type="button">Edit</button></td></tr>`; }
 
 function openMissionModal() {
-  $('#modal').innerHTML = `<div class="modal-head"><h2>提交 Mission</h2><button class="close-btn" data-close type="button" aria-label="关闭">×</button></div><p class="modal-intro">用几句话描述需求，系统会生成可接受方案。申请截止时间由平台按使用开始时间自动设置。</p><form id="mission-form"><div class="field"><label for="mission-title">标题</label><input id="mission-title" name="title" required placeholder="例如：Student product shoot" /></div><div class="field"><label for="mission-description">需要什么</label><textarea id="mission-description" name="description" required placeholder="例如：需要相机、灯光和小型场地"></textarea></div><div class="form-grid"><div class="field"><label for="mission-location">地点</label><input id="mission-location" name="location" required placeholder="Main Building" /></div><div class="field"><label for="mission-start">开始使用</label><input id="mission-start" type="datetime-local" name="start_at" required /></div><div class="field"><label for="mission-end">结束使用</label><input id="mission-end" type="datetime-local" name="end_at" required /></div></div><div class="form-actions"><button class="secondary-btn" data-close type="button">取消</button><button class="primary-btn" type="submit">提交申请 →</button></div></form>`;
+  $('#modal').innerHTML = `<div class="modal-head"><h2>Submit a Mission</h2><button class="close-btn" data-close type="button" aria-label="Close">×</button></div><p class="modal-intro">Briefly describe what you need. The platform will suggest options and set the deadline automatically.</p><form id="mission-form"><div class="field"><label for="mission-title">Title</label><input id="mission-title" name="title" required placeholder="For example: Student product shoot" /></div><div class="field"><label for="mission-description">What do you need?</label><textarea id="mission-description" name="description" required placeholder="For example: a camera, lights, and a small studio"></textarea></div><div class="form-grid"><div class="field"><label for="mission-location">Location</label><input id="mission-location" name="location" required placeholder="Main Building" /></div><div class="field"><label for="mission-start">Start time</label><input id="mission-start" type="datetime-local" name="start_at" required /></div><div class="field"><label for="mission-end">End time</label><input id="mission-end" type="datetime-local" name="end_at" required /></div></div><div class="form-actions"><button class="secondary-btn" data-close type="button">Cancel</button><button class="primary-btn" type="submit">Submit request →</button></div></form>`;
   openModal();
   $('#mission-form').addEventListener('submit', submitMission);
 }
@@ -164,7 +187,7 @@ async function submitMission(event) {
   event.preventDefault();
   const form = new FormData(event.target);
   const payload = { title: form.get('title'), description: form.get('description'), location: form.get('location'), start_at: iso(form.get('start_at')), end_at: iso(form.get('end_at')) };
-  try { const result = await api('/api/missions', { method: 'POST', body: JSON.stringify(payload) }); closeModal(); await refresh(); setView('missions'); toast('Mission 已提交，等待申请窗口截止'); if (result.mission?.id) openMissionDetail(result.mission.id); } catch (error) { toast(error.message, true); }
+  try { const result = await api('/api/missions', { method: 'POST', body: JSON.stringify(payload) }); closeModal(); await refresh(); setView('missions'); toast('Mission submitted. Waiting for the application deadline.'); if (result.mission?.id) openMissionDetail(result.mission.id); } catch (error) { toast(error.message, true); }
 }
 
 function resourceForm(resource) {
@@ -172,14 +195,20 @@ function resourceForm(resource) {
   const base = new Date(Date.now() + 24 * 36e5);
   const end = new Date(Date.now() + 72 * 36e5);
   const value = key => resource?.[key] ?? '';
-  return `<div class="modal-head"><h2>${editing ? '编辑我的资源' : '开放资源'}</h2><button class="close-btn" data-close type="button" aria-label="关闭">×</button></div><p class="modal-intro">${editing ? '更新本组织已上架资源的内容或状态。已有预约的资源可能需要管理员处理。' : '发布资源的临时使用权，所有权仍属于你的组织。'}</p><form id="resource-form" data-resource-id="${editing ? esc(resource.id) : ''}"><div class="form-grid"><div class="field full"><label for="resource-name">资源名称</label><input id="resource-name" name="name" required value="${esc(value('name'))}" placeholder="例如：Portable lighting set" /></div><div class="field"><label for="resource-type">类型</label><select id="resource-type" name="type"><option value="equipment" ${value('type') === 'equipment' ? 'selected' : ''}>设备</option><option value="skill" ${value('type') === 'skill' ? 'selected' : ''}>技能</option><option value="space" ${value('type') === 'space' ? 'selected' : ''}>场地</option><option value="people" ${value('type') === 'people' ? 'selected' : ''}>人力</option></select></div><div class="field"><label for="resource-capability">能力关键词</label><input id="resource-capability" name="capability" required value="${esc(value('capability'))}" placeholder="camera, 4K video" /></div><div class="field full"><label for="resource-features">具体特征</label><input id="resource-features" name="features" value="${esc(value('features'))}" placeholder="规格、语言、座位数或使用条件" /></div><div class="field"><label for="resource-location">位置</label><input id="resource-location" name="location" required value="${esc(value('location'))}" placeholder="Main Building" /></div><div class="field"><label for="resource-capacity">容量</label><input id="resource-capacity" type="number" min="1" step="1" name="capacity" value="${esc(value('capacity') || 1)}" /></div><div class="field"><label for="resource-condition">状态描述</label><input id="resource-condition" name="condition" value="${esc(value('condition'))}" placeholder="Good" /></div><div class="field"><label for="resource-value">参考价值 / 小时（HKD）</label><input id="resource-value" type="number" min="0" step="0.01" name="hourly_value" value="${esc(value('hourly_value') || 0)}" /></div><div class="field"><label for="resource-start">可用开始</label><input id="resource-start" type="datetime-local" name="availability_start" required value="${localInput(value('availability_start') || base)}" /></div><div class="field"><label for="resource-end">可用结束</label><input id="resource-end" type="datetime-local" name="availability_end" required value="${localInput(value('availability_end') || end)}" /></div>${editing ? `<div class="field"><label for="resource-status">资源状态</label><select id="resource-status" name="status"><option value="available" ${value('status') === 'available' ? 'selected' : ''}>可申请</option><option value="offline" ${value('status') === 'offline' ? 'selected' : ''}>暂不可用</option><option value="maintenance" ${value('status') === 'maintenance' ? 'selected' : ''}>维护中</option></select></div>` : ''}</div><div class="form-actions"><button class="secondary-btn" data-close type="button">取消</button><button class="primary-btn" type="submit">${editing ? '保存修改' : '发布资源'}</button></div></form>`;
+  const savedSource = value('cost_source');
+  const sourceOptions = [['Public listing','Public listing'],['Campus rate','Campus rate'],['Published campus rate','Published campus rate'],['External market quote','External market quote'],['Previous transaction','Previous transaction'],['Organization estimate','Organization estimate'],['Other','Other']];
+  const sourceValue = sourceOptions.some(([, option]) => option === savedSource) ? savedSource : (savedSource ? 'Other' : 'Organization estimate');
+  return `<div class="modal-head"><h2>${editing ? 'Edit my resource' : 'Publish resource'}</h2><button class="close-btn" data-close type="button" aria-label="Close">×</button></div><p class="modal-intro">${editing ? 'Update the content or status of a resource published by this organization. Resources with bookings may need admin review.' : 'Share temporary access to this resource while ownership stays with your organization.'}</p><form id="resource-form" data-resource-id="${editing ? esc(resource.id) : ''}"><div class="form-grid"><div class="field full"><label for="resource-name">Resource name</label><input id="resource-name" name="name" required value="${esc(value('name'))}" placeholder="For example: Portable lighting set" /></div><div class="field"><label for="resource-type">Type</label><select id="resource-type" name="type"><option value="equipment" ${value('type') === 'equipment' ? 'selected' : ''}>Equipment</option><option value="skill" ${value('type') === 'skill' ? 'selected' : ''}>Skill</option><option value="space" ${value('type') === 'space' ? 'selected' : ''}>Space</option><option value="people" ${value('type') === 'people' ? 'selected' : ''}>People</option></select></div><div class="field"><label for="resource-capability">Capability keywords</label><input id="resource-capability" name="capability" required value="${esc(value('capability'))}" placeholder="camera, 4K video" /></div><div class="field full"><label for="resource-features">Details</label><input id="resource-features" name="features" value="${esc(value('features'))}" placeholder="Specifications, languages, seats, or usage conditions" /></div><div class="field"><label for="resource-location">Location</label><input id="resource-location" name="location" required value="${esc(value('location'))}" placeholder="Main Building" /></div><div class="field"><label for="resource-capacity">Capacity</label><input id="resource-capacity" type="number" min="1" step="1" name="capacity" value="${esc(value('capacity') || 1)}" /></div><div class="field"><label for="resource-condition">Condition</label><input id="resource-condition" name="condition" value="${esc(value('condition'))}" placeholder="Good" /></div><div class="field"><label for="resource-value">Reference value / hour (HKD)</label><input id="resource-value" type="number" min="0" step="0.01" name="hourly_value" value="${esc(value('hourly_value') || 0)}" /></div><div class="field full"><label for="resource-external-cost">External replacement cost (HKD / hour)</label><small class="field-help">The estimated hourly amount to rent or buy an equivalent resource elsewhere if the platform cannot match one.</small><input id="resource-external-cost" type="number" min="0" step="0.01" name="external_hourly_cost" value="${esc(value('external_hourly_cost') || value('hourly_value') || 0)}" /></div><div class="field"><label for="resource-cost-source">Cost reference</label><select id="resource-cost-source" name="cost_source"><option value="Public listing" ${sourceValue === 'Public listing' ? 'selected' : ''}>Public listing</option><option value="Campus rate" ${sourceValue === 'Campus rate' ? 'selected' : ''}>Campus rate</option><option value="Published campus rate" ${sourceValue === 'Published campus rate' ? 'selected' : ''}>Published campus rate</option><option value="External market quote" ${sourceValue === 'External market quote' ? 'selected' : ''}>External market quote</option><option value="Previous transaction" ${sourceValue === 'Previous transaction' ? 'selected' : ''}>Previous transaction</option><option value="Organization estimate" ${sourceValue === 'Organization estimate' ? 'selected' : ''}>Organization estimate</option><option value="Other" ${sourceValue === 'Other' ? 'selected' : ''}>Other</option></select></div><div class="field" id="resource-cost-other-wrap" ${sourceValue !== 'Other' ? 'hidden' : ''}><label for="resource-cost-other">Describe the other source</label><input id="resource-cost-other" name="cost_source_other" value="${sourceValue === 'Other' ? esc(savedSource) : ''}" placeholder="For example: supplier email quote" /></div><div class="field"><label for="resource-start">Available from</label><input id="resource-start" type="datetime-local" name="availability_start" required value="${localInput(value('availability_start') || base)}" /></div><div class="field"><label for="resource-end">Available until</label><input id="resource-end" type="datetime-local" name="availability_end" required value="${localInput(value('availability_end') || end)}" /></div>${editing ? `<div class="field"><label for="resource-status">Resource status</label><select id="resource-status" name="status"><option value="available" ${value('status') === 'available' ? 'selected' : ''}>Available</option><option value="offline" ${value('status') === 'offline' ? 'selected' : ''}>Unavailable</option><option value="maintenance" ${value('status') === 'maintenance' ? 'selected' : ''}>Under maintenance</option></select></div>` : ''}</div><div class="form-actions"><button class="secondary-btn" data-close type="button">Cancel</button><button class="primary-btn" type="submit">${editing ? 'Save changes' : 'Publish resource'}</button></div></form>`;
 }
 async function openResourceModal(resourceId) {
   let resource = null;
   if (resourceId) resource = arr(state.data.resources).find(item => String(item.id) === String(resourceId));
-  if (resource && !ownResource(resource)) { toast('只能编辑本组织的资源', true); return; }
+  if (resource && !ownResource(resource)) { toast('You can only edit resources owned by this organization', true); return; }
   $('#modal').innerHTML = resourceForm(resource);
   openModal();
+  const sourceSelect = $('#resource-cost-source');
+  const otherWrap = $('#resource-cost-other-wrap');
+  if (sourceSelect && otherWrap) sourceSelect.addEventListener('change', () => { otherWrap.hidden = sourceSelect.value !== 'Other'; });
   $('#resource-form').addEventListener('submit', submitResource);
 }
 async function submitResource(event) {
@@ -188,16 +217,19 @@ async function submitResource(event) {
   const payload = Object.fromEntries(form.entries());
   payload.capacity = Number(payload.capacity || 1);
   payload.hourly_value = Number(payload.hourly_value || 0);
+  payload.external_hourly_cost = Number(payload.external_hourly_cost || payload.hourly_value || 0);
+  payload.cost_source = payload.cost_source === 'Other' ? (payload.cost_source_other || 'Other') : payload.cost_source;
+  delete payload.cost_source_other;
   payload.availability_start = iso(payload.availability_start);
   payload.availability_end = iso(payload.availability_end);
   const id = event.target.dataset.resourceId;
-  try { await api(id ? `/api/resources/${id}` : '/api/resources', { method: id ? 'PATCH' : 'POST', body: JSON.stringify(payload) }); closeModal(); await refresh(); toast(id ? '资源信息已更新' : '资源已发布'); setView(state.view === 'profile' ? 'profile' : 'resources'); } catch (error) { toast(error.message, true); }
+  try { await api(id ? `/api/resources/${id}` : '/api/resources', { method: id ? 'PATCH' : 'POST', body: JSON.stringify(payload) }); closeModal(); await refresh(); toast(id ? 'Resource updated' : 'Resource published'); setView(state.view === 'profile' ? 'profile' : 'resources'); } catch (error) { toast(error.message, true); }
 }
 
 function planCards(mission, preferences) {
   const plans = arr(mission.plans);
-  if (!plans.length) return '<div class="empty">目前没有满足条件的完整方案，请调整需求或时间。</div>';
-  return plans.map(plan => `<div class="plan-card ${preferences.includes(plan.id) ? 'selected' : ''}" data-plan-card="${esc(plan.id)}"><div class="plan-top"><input type="checkbox" value="${esc(plan.id)}" ${preferences.includes(plan.id) ? 'checked' : ''} aria-label="接受 ${esc(plan.label || plan.id)}" /><strong>${esc(plan.label || '方案')} · ${arr(plan.items).length} 项资源</strong><span class="plan-score">${num(plan.match_score) === null ? '—' : `${Math.round(plan.match_score * 100)}%`}</span></div><div class="plan-items">${arr(plan.items).map(item => `<span class="plan-item">${esc(item.resource || item.name || '')} · ${esc(item.owner || '')}</span>`).join('')}</div>${plan.tradeoff ? `<div class="plan-note">${esc(plan.tradeoff)}</div>` : ''}<div class="plan-order"><button type="button" data-plan-up="${esc(plan.id)}" aria-label="方案上移">↑</button><button type="button" data-plan-down="${esc(plan.id)}" aria-label="方案下移">↓</button><small>按卡片顺序保存优先级</small></div></div>`).join('');
+  if (!plans.length) return '<div class="empty">No complete option matches these requirements. Try changing the request or time.</div>';
+  return plans.map(plan => `<div class="plan-card ${preferences.includes(plan.id) ? 'selected' : ''}" data-plan-card="${esc(plan.id)}"><div class="plan-top"><input type="checkbox" value="${esc(plan.id)}" ${preferences.includes(plan.id) ? 'checked' : ''} aria-label="Accept ${esc(plan.label || plan.id)}" /><strong>${esc(plan.label || 'Option')} · ${arr(plan.items).length} resources</strong><span class="plan-score">${num(plan.match_score) === null ? '—' : `${Math.round(plan.match_score * 100)}%`}</span></div><div class="plan-items">${arr(plan.items).map(item => `<span class="plan-item">${esc(item.resource || item.name || '')} · ${esc(item.owner || '')}</span>`).join('')}</div>${plan.tradeoff ? `<div class="plan-note">${esc(plan.tradeoff)}</div>` : ''}<div class="plan-order"><button type="button" data-plan-up="${esc(plan.id)}" aria-label="Move option up">↑</button><button type="button" data-plan-down="${esc(plan.id)}" aria-label="Move option down">↓</button><small>Options are saved in card order</small></div></div>`).join('');
 }
 async function openMissionDetail(id) {
   try {
@@ -207,16 +239,19 @@ async function openMissionDetail(id) {
     const preferences = arr(mission.preferences);
     const waiting = ['open', 'waitlisted'].includes(mission.status);
     const score = num(mission.fairness?.score);
-    $('#modal').innerHTML = `<div class="modal-head"><h2>${esc(mission.title)}</h2><button class="close-btn" data-close type="button" aria-label="关闭">×</button></div><div class="mission-detail"><div class="panel detail-panel" style="box-shadow:none"><div class="eyebrow">Mission 详情</div><p class="lead">${esc(mission.description)}</p><div class="req-list">${arr(mission.requirements).map(requirement => `<span class="req-chip">✓ ${esc(requirement.label || requirement.text || requirement.name || '')}</span>`).join('')}</div><div class="mission-detail-meta">${statusTag(mission.status)} <span>地点：${esc(mission.location || '—')}</span><span>使用：${fmtDate(mission.start_at)} – ${fmtDate(mission.end_at)}</span><span>申请截止：${fmtDate(mission.deadline)}</span></div>${waiting ? `<h3 class="detail-subtitle">可接受方案</h3><p class="modal-intro">选择方案并用箭头调整优先顺序，申请截止前可以修改。</p><div id="plans">${planCards(mission, preferences)}</div><div class="form-actions"><button class="secondary-btn" id="save-prefs" type="button">保存方案偏好</button></div>` : `<div class="approval-notice"><strong>${esc(missionStatus(mission.status))}</strong><span>平台会在状态变化时通知本组织。</span></div>`}</div><div><div class="panel detail-panel" style="box-shadow:none"><div class="eyebrow">当前状态</div><div class="score-box"><div class="score-label">Fairness Score</div><div class="score-big">${score === null ? '—' : `${Math.round(score * 100)} / 100`}</div></div>${['allocated', 'frozen'].includes(mission.status) ? '<p class="approved-copy">Mission / 资源 / 场地已获批，可在使用时间到达后开始使用。</p>' : ''}${mission.status === 'in_use' ? '<p class="approved-copy">正在使用中。完成归还后请确认完成。</p>' : ''}<div class="detail-actions">${mission.status === 'allocated' || mission.status === 'frozen' ? '<button class="secondary-btn" id="checkout" type="button">开始使用</button>' : ''}${mission.status === 'in_use' ? '<button class="primary-btn" id="complete" type="button">完成归还</button>' : ''}${['open', 'waitlisted', 'allocated', 'frozen'].includes(mission.status) ? '<button class="secondary-btn" id="withdraw" type="button">取消 Mission</button>' : ''}${['allocated', 'frozen', 'in_use', 'completed'].includes(mission.status) ? '<button class="text-link" id="dispute" type="button">发起争议</button>' : ''}</div></div></div></div>`;
+    const disputes = arr(mission.disputes);
+    const disputePanel = disputes.length ? `<div class="dispute-list">${disputes.map(dispute => `<div class="dispute-item"><div><strong>Dispute #${esc(dispute.id)}</strong> <span class="mission-status status-${esc(dispute.status || 'unknown')}">${esc(disputeStatus(dispute.status))}</span><p>${esc(dispute.description)}</p><small>${dispute.compensation_amount > 0 ? `Compensation request HKD ${Number(dispute.compensation_amount).toFixed(2)} · ` : ''}${arr(dispute.evidence).length} evidence file(s) · ${esc(disputeStatus(dispute.status))}</small></div>${dispute.status === 'awaiting_victim' ? `<button class="primary-btn compact" data-resolve-dispute="${esc(dispute.id)}" type="button">Mark as resolved</button>` : ''}</div>`).join('')}</div>` : '';
+    $('#modal').innerHTML = `<div class="modal-head"><h2>${esc(mission.title)}</h2><button class="close-btn" data-close type="button" aria-label="Close">×</button></div><div class="mission-detail"><div class="panel detail-panel" style="box-shadow:none"><div class="eyebrow">Mission details</div><p class="lead">${esc(mission.description)}</p><div class="req-list">${arr(mission.requirements).map(requirement => `<span class="req-chip">✓ ${esc(requirement.label || requirement.text || requirement.name || '')}</span>`).join('')}</div><div class="mission-detail-meta">${statusTag(mission.status)} <span>Location: ${esc(mission.location || '—')}</span><span>Use: ${fmtDate(mission.start_at)} – ${fmtDate(mission.end_at)}</span><span>Deadline: ${fmtDate(mission.deadline)}</span></div>${waiting ? `<h3 class="detail-subtitle">Acceptable options</h3><p class="modal-intro">Select options and use the arrows to set your priority. You can edit this before the deadline.</p><div id="plans">${planCards(mission, preferences)}</div><div class="form-actions"><button class="secondary-btn" id="save-prefs" type="button">Save option preferences</button></div>` : `<div class="approval-notice"><strong>${esc(missionStatus(mission.status))}</strong><span>Your organization will be notified when the status changes.</span></div>`}${disputePanel}</div><div><div class="panel detail-panel" style="box-shadow:none"><div class="eyebrow">Current status</div><div class="score-box"><div class="score-label">Fairness Score</div><div class="score-big">${score === null ? '—' : `${Math.round(score * 100)} / 100`}</div></div>${['allocated', 'frozen'].includes(mission.status) ? '<p class="approved-copy">The Mission and requested resources are approved. You can start when the scheduled time arrives.</p>' : ''}${mission.status === 'in_use' ? '<p class="approved-copy">This Mission is in use. Confirm completion after returning the resources.</p>' : ''}<div class="detail-actions">${mission.status === 'allocated' || mission.status === 'frozen' ? '<button class="secondary-btn" id="checkout" type="button">Start using</button>' : ''}${mission.status === 'in_use' ? '<button class="primary-btn" id="complete" type="button">Confirm return</button>' : ''}${['open', 'waitlisted', 'allocated', 'frozen'].includes(mission.status) ? '<button class="secondary-btn" id="withdraw" type="button">Cancel Mission</button>' : ''}${['allocated', 'frozen', 'in_use', 'completed'].includes(mission.status) ? '<button class="text-link" id="dispute" type="button">Report a dispute</button>' : ''}</div></div></div></div>`;
     openModal();
     $$('#plans input[type="checkbox"]').forEach(input => input.addEventListener('change', () => input.closest('.plan-card').classList.toggle('selected', input.checked)));
     $$('[data-plan-up]').forEach(button => button.addEventListener('click', () => movePlan(button.dataset.planUp, -1)));
     $$('[data-plan-down]').forEach(button => button.addEventListener('click', () => movePlan(button.dataset.planDown, 1)));
     $('#save-prefs')?.addEventListener('click', () => savePreferences(id));
-    $('#checkout')?.addEventListener('click', () => missionAction(id, 'checkout', '已开始使用'));
-    $('#complete')?.addEventListener('click', () => missionAction(id, 'complete', '已确认归还，Mission 已完成'));
-    $('#withdraw')?.addEventListener('click', () => missionAction(id, 'withdraw', 'Mission 已取消'));
+    $('#checkout')?.addEventListener('click', () => missionAction(id, 'checkout', 'Use started'));
+    $('#complete')?.addEventListener('click', () => missionAction(id, 'complete', 'Return confirmed; Mission completed'));
+    $('#withdraw')?.addEventListener('click', () => missionAction(id, 'withdraw', 'Mission cancelled'));
     $('#dispute')?.addEventListener('click', () => openDisputeModal(id));
+    $$('[data-resolve-dispute]').forEach(button => button.addEventListener('click', async () => { try { await api(`/api/disputes/${button.dataset.resolveDispute}/resolve`, { method: 'POST', body: JSON.stringify({ resolution_note: 'The affected organization confirms the compensation and handling are complete' }) }); toast('Dispute resolved. The platform is lifting the provider freeze.'); await refresh(); openMissionDetail(id); } catch (error) { toast(error.message, true); } }));
   } catch (error) { toast(error.message, true); }
 }
 function movePlan(id, direction) {
@@ -227,28 +262,33 @@ function movePlan(id, direction) {
 }
 async function savePreferences(id) {
   const preferences = $$('#plans input[type="checkbox"]:checked').map(input => input.value);
-  try { await api(`/api/missions/${id}/preferences`, { method: 'POST', body: JSON.stringify({ preferences }) }); toast('方案偏好已保存'); await refresh(); openMissionDetail(id); } catch (error) { toast(error.message, true); }
+  try { await api(`/api/missions/${id}/preferences`, { method: 'POST', body: JSON.stringify({ preferences }) }); toast('Option preferences saved'); await refresh(); openMissionDetail(id); } catch (error) { toast(error.message, true); }
 }
 async function missionAction(id, action, message) {
   try { await api(`/api/missions/${id}/${action}`, { method: 'POST', body: '{}' }); closeModal(); await refresh(); toast(message); } catch (error) { toast(error.message, true); }
 }
 function openDisputeModal(id) {
-  $('#modal').innerHTML = `<div class="modal-head"><h2>发起资源争议</h2><button class="close-btn" data-close type="button" aria-label="关闭">×</button></div><p class="modal-intro">描述设备或场地在使用前后的实际情况，平台会记录时间和 Mission。</p><form id="dispute-form"><div class="field"><label for="dispute-category">争议类型</label><select id="dispute-category" name="category"><option value="condition">设备状态不一致</option><option value="no-show">未交付 / No-show</option><option value="damage">损坏或遗失</option><option value="other">其他</option></select></div><div class="field"><label for="dispute-description">描述</label><textarea id="dispute-description" name="description" required placeholder="请描述发生了什么"></textarea></div><div class="form-actions"><button class="secondary-btn" data-close type="button">取消</button><button class="primary-btn" type="submit">提交争议</button></div></form>`;
+  const mission = state.mission || arr(state.data?.missions).find(item => String(item.id) === String(id)) || {};
+  const plan = arr(mission.plans).find(item => item.id === mission.allocated_plan_id) || arr(mission.plans)[0];
+  const providers = [];
+  arr(plan?.items).forEach(item => { const resource = arr(state.data?.resources).find(candidate => Number(candidate.id) === Number(item.resource_id)); const ownerId = resource?.owner_org_id ?? item.owner_org_id; const ownerName = resource?.owner_name || item.owner || `Organization #${ownerId}`; if (ownerId && !providers.some(provider => Number(provider.id) === Number(ownerId))) providers.push({ id: ownerId, name: ownerName }); });
+  const accusedField = providers.length > 1 ? `<div class="field"><label for="dispute-accused">Resource provider involved</label><select id="dispute-accused" name="accused_org_id" required>${providers.map(provider => `<option value="${esc(provider.id)}">${esc(provider.name)}</option>`).join('')}</select></div>` : providers.length === 1 ? `<input type="hidden" name="accused_org_id" value="${esc(providers[0].id)}" />` : '';
+  $('#modal').innerHTML = `<div class="modal-head"><h2>Report a resource dispute</h2><button class="close-btn" data-close type="button" aria-label="Close">×</button></div><p class="modal-intro">Describe what happened before and after use. For monetary compensation, enter the amount and upload evidence. If approved, the provider is frozen until you confirm the issue is resolved.</p><form id="dispute-form">${accusedField}<div class="field"><label for="dispute-category">Dispute type</label><select id="dispute-category" name="category"><option value="condition">Resource condition differs</option><option value="no-show">Not delivered / no-show</option><option value="damage">Damaged or lost</option><option value="other">Other</option></select></div><div class="field"><label for="dispute-description">Description</label><textarea id="dispute-description" name="description" required placeholder="Describe what happened"></textarea></div><div class="field"><label for="dispute-amount">Compensation amount (HKD, optional)</label><small class="field-help">The compensation review and account freeze process starts only when you enter an amount.</small><input id="dispute-amount" name="compensation_amount" type="number" min="0" step="0.01" placeholder="For example: 850" /></div><div class="field"><label for="dispute-evidence">Upload evidence (required for compensation)</label><input id="dispute-evidence" name="evidence_files" type="file" multiple accept="image/*,video/*,application/pdf,.doc,.docx" /><small class="field-help">Upload photos, videos, PDFs, or documents. Up to 5 files, 2 MB each.</small></div><div class="form-actions"><button class="secondary-btn" data-close type="button">Cancel</button><button class="primary-btn" type="submit">Submit dispute</button></div></form>`;
   openModal();
-  $('#dispute-form').addEventListener('submit', async event => { event.preventDefault(); try { const payload = Object.fromEntries(new FormData(event.target).entries()); await api(`/api/missions/${id}/disputes`, { method: 'POST', body: JSON.stringify(payload) }); closeModal(); await refresh(); toast('争议已提交'); } catch (error) { toast(error.message, true); } });
+  $('#dispute-form').addEventListener('submit', async event => { event.preventDefault(); try { const form = event.target; const payload = Object.fromEntries(new FormData(form).entries()); payload.compensation_amount = Number(payload.compensation_amount || 0); const files = [...($('#dispute-evidence')?.files || [])]; payload.evidence = await Promise.all(files.slice(0, 5).map(file => new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve({ name: file.name, type: file.type, size: file.size, data: reader.result }); reader.onerror = reject; reader.readAsDataURL(file); }))); delete payload.evidence_files; await api(`/api/missions/${id}/disputes`, { method: 'POST', body: JSON.stringify(payload) }); closeModal(); await refresh(); toast('Dispute submitted. Waiting for admin review.'); openMissionDetail(id); } catch (error) { toast(error.message, true); } });
 }
 
 function openProfileModal() { setView('profile'); }
 function searchResults(query) {
   const text = query.trim().toLowerCase();
-  if (!text) return '<div class="empty" style="padding:22px 0">输入资源或 Mission 名称</div>';
+  if (!text) return '<div class="empty" style="padding:22px 0">Enter a resource or Mission name</div>';
   const missions = arr(state.data.missions).filter(item => `${item.title} ${item.description}`.toLowerCase().includes(text));
   const resources = arr(state.data.resources).filter(item => `${item.name} ${item.capability} ${item.features} ${item.location}`.toLowerCase().includes(text));
-  const result = [...missions.map(item => `<button class="search-result" data-search-mission="${esc(item.id)}" type="button"><span class="tag purple">Mission</span><div><strong>${esc(item.title)}</strong><small>${esc(missionStatus(item.status))}</small></div><span>›</span></button>`), ...resources.map(item => `<button class="search-result" data-search-resource="${esc(item.id)}" type="button"><span class="tag blue">资源</span><div><strong>${esc(item.name)}</strong><small>${esc(item.owner_name || '')} · ${esc(item.location || '')}</small></div><span>›</span></button>` )];
-  return result.slice(0, 10).join('') || '<div class="empty" style="padding:22px 0">没有匹配结果</div>';
+  const result = [...missions.map(item => `<button class="search-result" data-search-mission="${esc(item.id)}" type="button"><span class="tag purple">Mission</span><div><strong>${esc(item.title)}</strong><small>${esc(missionStatus(item.status))}</small></div><span>›</span></button>`), ...resources.map(item => `<button class="search-result" data-search-resource="${esc(item.id)}" type="button"><span class="tag blue">Resource</span><div><strong>${esc(item.name)}</strong><small>${esc(item.owner_name || '')} · ${esc(item.location || '')}</small></div><span>›</span></button>` )];
+  return result.slice(0, 10).join('') || '<div class="empty" style="padding:22px 0">No matches found</div>';
 }
 function openGlobalSearch() {
-  $('#modal').innerHTML = `<div class="modal-head"><h2>搜索</h2><button class="close-btn" data-close type="button" aria-label="关闭">×</button></div><div class="field"><label for="global-search-input">搜索资源或我的 Mission</label><input id="global-search-input" autofocus placeholder="例如：camera、studio、demo" /></div><div id="search-results" style="margin-top:14px"></div>`;
+  $('#modal').innerHTML = `<div class="modal-head"><h2>Search</h2><button class="close-btn" data-close type="button" aria-label="Close">×</button></div><div class="field"><label for="global-search-input">Search resources or my Missions</label><input id="global-search-input" autofocus placeholder="For example: camera, studio, or demo" /></div><div id="search-results" style="margin-top:14px"></div>`;
   openModal();
   const input = $('#global-search-input');
   const update = () => { $('#search-results').innerHTML = searchResults(input.value); $$('[data-search-mission]').forEach(button => button.addEventListener('click', () => { closeModal(); openMissionDetail(button.dataset.searchMission); })); $$('[data-search-resource]').forEach(button => button.addEventListener('click', () => { closeModal(); openResourceInfo(button.dataset.searchResource); })); };
@@ -256,15 +296,19 @@ function openGlobalSearch() {
 }
 function openResourceInfo(id) {
   const resource = arr(state.data.resources).find(item => String(item.id) === String(id));
-  if (!resource) return toast('资源已不可用', true);
+  if (!resource) return toast('Resource is no longer available', true);
   const canEdit = ownResource(resource);
-  $('#modal').innerHTML = `<div class="modal-head"><h2>${esc(resource.name)}</h2><button class="close-btn" data-close type="button" aria-label="关闭">×</button></div><div class="resource-info"><p>${esc(resource.features || resource.capability || '暂无描述')}</p><dl><dt>提供组织</dt><dd>${esc(resource.owner_name || '')}</dd><dt>位置</dt><dd>${esc(resource.location || '—')}</dd><dt>可用时间</dt><dd>${fmtDate(resource.availability_start)} – ${fmtDate(resource.availability_end)}</dd><dt>状态</dt><dd>${esc(resourceStatus(resource.status))}</dd></dl></div><div class="form-actions">${canEdit ? `<button class="primary-btn" id="resource-info-edit" type="button">编辑我的资源</button>` : ''}<button class="secondary-btn" data-close type="button">关闭</button></div>`;
+  $('#modal').innerHTML = `<div class="modal-head"><h2>${esc(resource.name)}</h2><button class="close-btn" data-close type="button" aria-label="Close">×</button></div><div class="resource-info"><p>${esc(resource.features || resource.capability || 'No description')}</p><dl><dt>Provider</dt><dd>${esc(resource.owner_name || '')}</dd><dt>Location</dt><dd>${esc(resource.location || '—')}</dd><dt>Available time</dt><dd>${fmtDate(resource.availability_start)} – ${fmtDate(resource.availability_end)}</dd><dt>Status</dt><dd>${esc(resourceStatus(resource.status))}</dd></dl></div><div class="form-actions">${canEdit ? `<button class="primary-btn" id="resource-info-edit" type="button">Edit my resource</button>` : ''}<button class="secondary-btn" data-close type="button">Close</button></div>`;
   openModal();
   $('#resource-info-edit')?.addEventListener('click', () => openResourceModal(id));
 }
 function openActivityModal() {
   const events = arr(state.data.events);
-  $('#modal').innerHTML = `<div class="modal-head"><h2>最近活动</h2><button class="close-btn" data-close type="button" aria-label="关闭">×</button></div><p class="modal-intro">这里只显示与 ${esc(org().short_name || '本组织')} 相关的通知。</p><div class="activity-list" style="padding:0">${events.length ? events.map(eventRow).join('') : '<div class="empty">暂无通知</div>'}</div>`;
+  $('#modal').innerHTML = `<div class="modal-head"><h2>Recent activity</h2><button class="close-btn" data-close type="button" aria-label="Close">×</button></div><p class="modal-intro">Only notifications related to ${esc(org().short_name || 'this organization')} are shown here.</p><div class="activity-list" style="padding:0">${events.length ? events.map(eventRow).join('') : '<div class="empty">No notifications yet</div>'}</div>`;
+  openModal();
+}
+function openHelpModal() {
+  $('#modal').innerHTML = `<div class="modal-head"><h2>Resource and Mission guide</h2><button class="close-btn" data-close type="button" aria-label="Close">×</button></div><div class="help-guide"><div class="help-guide-item"><span class="help-guide-icon">1</span><div><strong>1. Publish resources first</strong><p>In Resources, click “Publish resource” and add its type, capabilities, schedule, location, and status. You can edit published resources from your profile.</p></div></div><div class="help-guide-item"><span class="help-guide-icon">2</span><div><strong>2. Submit a Mission</strong><p>Describe the need, location, and time. After the deadline, the platform resolves conflicts and produces an allocation.</p></div></div><div class="help-guide-item"><span class="help-guide-icon">3</span><div><strong>3. Check the result</strong><p>When a Mission, piece of equipment, or space is approved, the result appears in the Mission details and organization notifications.</p></div></div></div><div class="form-actions"><button class="primary-btn" data-close type="button">Got it</button></div>`;
   openModal();
 }
 function openOrgMenu() {
@@ -274,9 +318,9 @@ function openOrgMenu() {
   const menu = document.createElement('div');
   menu.className = 'org-menu';
   menu.setAttribute('role', 'menu');
-  menu.innerHTML = `${organizations.map(item => `<button type="button" data-org="${esc(item.id)}"><span class="avatar">${esc((item.short_name || item.name || '—')[0])}</span><div><strong>${esc(item.short_name || item.name)}</strong><small>本地演示组织会话</small></div></button>`).join('') || '<div class="empty">暂无可切换组织</div>'}`;
+  menu.innerHTML = `${organizations.map(item => `<button type="button" data-org="${esc(item.id)}"><span class="avatar">${esc((item.short_name || item.name || '—')[0])}</span><div><strong>${esc(item.short_name || item.name)}</strong><small>Local demo organization session</small></div></button>`).join('') || '<div class="empty">No organizations available</div>'}`;
   document.body.appendChild(menu);
-  $$('[data-org]', menu).forEach(button => button.addEventListener('click', async () => { try { await api('/api/switch-user', { method: 'POST', body: JSON.stringify({ organization_id: Number(button.dataset.org) }) }); menu.remove(); await refresh(); toast(`已切换到 ${state.data.organization.short_name || state.data.organization.name}`); } catch (error) { toast(error.message, true); } }));
+  $$('[data-org]', menu).forEach(button => button.addEventListener('click', async () => { try { await api('/api/switch-user', { method: 'POST', body: JSON.stringify({ organization_id: Number(button.dataset.org) }) }); menu.remove(); await refresh(); toast(`Switched to ${state.data.organization.short_name || state.data.organization.name}`); } catch (error) { toast(error.message, true); } }));
 }
 function openModal() { const backdrop = $('#modal-backdrop'); backdrop.classList.add('open'); backdrop.setAttribute('aria-hidden', 'false'); $$('[data-close]').forEach(button => button.addEventListener('click', closeModal)); }
 function closeModal() { const backdrop = $('#modal-backdrop'); backdrop.classList.remove('open'); backdrop.setAttribute('aria-hidden', 'true'); }
@@ -285,29 +329,50 @@ async function openAdminConsole() {
   if (adminHost) return;
   try {
     const response = await fetch('/static/admin.html', { credentials: 'same-origin' });
-    if (!response.ok) throw new Error('管理端界面加载失败');
+    if (!response.ok) throw new Error('Could not load the admin console');
     const html = await response.text();
     const parsed = new DOMParser().parseFromString(html, 'text/html');
     const shell = parsed.querySelector('.admin-shell');
-    if (!shell) throw new Error('管理端界面无效');
+    if (!shell) throw new Error('The admin console is invalid');
     adminHost = document.createElement('div');
     adminHost.className = 'admin-modal-host';
     adminHost.setAttribute('role', 'dialog');
-    adminHost.setAttribute('aria-label', '管理端');
+    adminHost.setAttribute('aria-label', 'admin console');
     adminHost.innerHTML = shell.outerHTML;
     document.body.appendChild(adminHost);
     if (!document.querySelector('link[data-admin-css]')) {
       const style = document.createElement('link'); style.rel = 'stylesheet'; style.href = '/static/admin.css'; style.dataset.adminCss = '1'; document.head.appendChild(style);
     }
-    window.closeAdminConsole = () => { adminHost?.remove(); adminHost = null; delete window.closeAdminConsole; };
-    const script = document.createElement('script'); script.src = '/static/admin.js?overlay=20261003'; adminHost.appendChild(script);
+    window.closeAdminConsole = () => { window.stopAdminSync?.(); adminHost?.remove(); adminHost = null; delete window.closeAdminConsole; };
+    const script = document.createElement('script'); script.src = '/static/admin.js?overlay=20261003en1'; adminHost.appendChild(script);
   } catch (error) { toast(error.message, true); }
 }
 async function refresh() {
   state.data = await api('/api/bootstrap');
-  $('#org-name').textContent = state.data.organization?.short_name || state.data.organization?.name || '当前组织';
+  $('#org-name').textContent = state.data.organization?.short_name || state.data.organization?.name || 'my organization';
   $('#org-avatar').textContent = (state.data.organization?.short_name || state.data.organization?.name || '—')[0];
   renderView();
+  startUserSync();
+}
+async function syncUserData() {
+  if (!state.data || userSyncBusy) return;
+  userSyncBusy = true;
+  try {
+    const next = await api('/api/bootstrap');
+    if (next.version !== state.data.version) {
+      state.data = next;
+      $('#org-name').textContent = next.organization?.short_name || next.organization?.name || 'my organization';
+      $('#org-avatar').textContent = (next.organization?.short_name || next.organization?.name || '—')[0];
+      renderView();
+    }
+  } catch (_) {
+    // A temporary polling failure should not interrupt the user flow.
+  } finally {
+    userSyncBusy = false;
+  }
+}
+function startUserSync() {
+  if (!userSyncTimer) userSyncTimer = window.setInterval(syncUserData, 5000);
 }
 function boot() {
   navSetup();
@@ -316,6 +381,7 @@ function boot() {
   $('.brand-mark')?.addEventListener('click', () => { brandClicks += 1; window.clearTimeout(brandTimer); brandTimer = window.setTimeout(() => { brandClicks = 0; }, 1500); if (brandClicks >= 5) { brandClicks = 0; openAdminConsole(); } });
   $('#switch-org').addEventListener('click', openOrgMenu);
   $('#workspace-profile').addEventListener('click', openProfileModal);
+  $('#help-guide').addEventListener('click', openHelpModal);
   $('#global-search').addEventListener('click', openGlobalSearch);
   $('#activity-toggle').addEventListener('click', openActivityModal);
   window.addEventListener('keydown', event => { if (event.altKey && event.shiftKey && event.key.toLowerCase() === 'a') { event.preventDefault(); openAdminConsole(); } });
