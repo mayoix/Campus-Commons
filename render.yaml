@@ -3,4 +3,4 @@ services:
     name: campus-commons
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python server.py
+    startCommand: python render_start.py
