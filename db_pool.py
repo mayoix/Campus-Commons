@@ -29,7 +29,9 @@ def get_pool():
             min_size=2,
             max_size=10,
             kwargs={"row_factory": dict_row},
+            open=False
         )
+        _pool.open(wait=True)
     return _pool
 
 
@@ -67,7 +69,7 @@ class ConnectionAdapter:
         self.connection.rollback()
 
     def close(self):
-        self.connection.close()
+        return None
 
     def __enter__(self):
         return self
@@ -88,12 +90,17 @@ def _translate(statement):
 
 class PooledConnection:
     def __enter__(self):
-        self.connection = get_pool().connection()
-        self.connection.__enter__()
+        self.connection = get_pool().getconn()
         return ConnectionAdapter(self.connection)
 
     def __exit__(self, exc_type, exc, tb):
-        return self.connection.__exit__(exc_type, exc, tb)
+        try:
+            if exc_type:
+                self.connection.rollback()
+            else:
+                self.connection.commit()
+        finally:
+            get_pool().putconn(self.connection)
 
 
 def pooled_connection():
