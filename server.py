@@ -32,9 +32,11 @@ from urllib.parse import parse_qs, urlparse
 try:
     import psycopg
     from psycopg.rows import dict_row
+    from psycopg_pool import ConnectionPool
 except ImportError:  # Cloud mode reports a helpful setup error when selected.
     psycopg = None
     dict_row = None
+    ConnectionPool = None
 
 
 ROOT = Path(__file__).resolve().parent
@@ -42,6 +44,8 @@ DB_PATH = Path(os.environ.get("CAMPUS_DB_PATH", str(ROOT / "campus_commons.sqlit
 STATIC_DIR = ROOT / "static"
 UTC = timezone.utc
 DB_LOCK = threading.RLock()
+_CLOUD_POOL = None
+_CLOUD_POOL_DSN = None
 USER_SESSIONS: dict[str, int] = {}
 ADMIN_SESSIONS: set[str] = set()
 ADMIN_PASSWORD_PATH = ROOT / ".admin-password"
@@ -154,10 +158,29 @@ class CompatRow(dict):
 
 
 class CloudConnection:
+    """SQLite-shaped adapter backed by a shared psycopg connection pool.
+
+    A request checks out one already-authenticated connection and returns it
+    to the pool on close. This keeps the existing query layer unchanged while
+    avoiding a new TLS/login handshake for every HTTP request.
+    """
     def __init__(self, dsn: str):
-        if psycopg is None:
-            raise RuntimeError("Supabase is configured, but psycopg is not installed. Run: python3 -m pip install 'psycopg[binary]'")
-        self._conn = psycopg.connect(dsn, connect_timeout=15, row_factory=dict_row)
+        global _CLOUD_POOL, _CLOUD_POOL_DSN
+        if psycopg is None or ConnectionPool is None:
+            raise RuntimeError("Supabase is configured, but psycopg[binary] and psycopg_pool are required. Run: python3 -m pip install 'psycopg[binary]' psycopg_pool")
+        with DB_LOCK:
+            if _CLOUD_POOL is None or _CLOUD_POOL_DSN != dsn:
+                if _CLOUD_POOL is not None:
+                    _CLOUD_POOL.close()
+                _CLOUD_POOL = ConnectionPool(
+                    conninfo=dsn, min_size=1, max_size=int(os.environ.get("SUPABASE_POOL_MAX", "10")),
+                    timeout=15, open=False, kwargs={"connect_timeout": 15, "row_factory": dict_row}
+                )
+                _CLOUD_POOL.open(wait=True)
+                _CLOUD_POOL_DSN = dsn
+            self._pool = _CLOUD_POOL
+            self._conn = self._pool.getconn(timeout=15)
+        self._closed = False
 
     def execute(self, statement, params=None):
         return CloudCursor(self._conn.execute(CloudCursor._translate(statement), params or ()))
@@ -172,14 +195,28 @@ class CloudConnection:
         self._conn.rollback()
 
     def close(self):
-        self._conn.close()
+        if not self._closed:
+            self._closed = True
+            try:
+                self._pool.putconn(self._conn)
+            except Exception:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
 
     def __enter__(self):
-        self._conn.__enter__()
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        return self._conn.__exit__(exc_type, exc, tb)
+        try:
+            if exc_type:
+                self.rollback()
+            else:
+                self.commit()
+        finally:
+            self.close()
+        return False
 
 
 def connect() -> sqlite3.Connection:
@@ -782,6 +819,12 @@ def build_plans(db: sqlite3.Connection, requirements: list[dict], location: str,
     """
     resources = [dict(r) for r in db.execute("SELECT r.*, o.short_name AS owner_name, o.credit_score FROM resources r JOIN organizations o ON o.id=r.owner_org_id WHERE r.status='available' AND o.suspended=0").fetchall()]
     start_dt, end_dt = parse_dt(start), parse_dt(end)
+    # Load active bookings once per plan build. The previous implementation
+    # queried Supabase/SQLite once for every resource, which made mission
+    # submission scale linearly with the number of resources.
+    active_bookings = {}
+    for booking in db.execute("SELECT resource_id,quantity,start_at,end_at FROM bookings WHERE status='active'").fetchall():
+        active_bookings.setdefault(int(booking["resource_id"]), []).append(booking)
     choices = []
     for req in requirements:
         matching = []
@@ -792,7 +835,7 @@ def build_plans(db: sqlite3.Connection, requirements: list[dict], location: str,
             if rs > start_dt or re_ < end_dt:
                 continue
             used = 0.0
-            for booking in db.execute("SELECT quantity,start_at,end_at FROM bookings WHERE resource_id=? AND status='active'", (resource["id"],)).fetchall():
+            for booking in active_bookings.get(int(resource["id"]), []):
                 bs, be = parse_dt(booking["start_at"]), parse_dt(booking["end_at"])
                 if bs and be and bs < end_dt and start_dt < be:
                     used += float(booking["quantity"] or 0)
@@ -914,12 +957,16 @@ def mission_allocation_details(db: sqlite3.Connection, row: sqlite3.Row) -> list
     return result
 
 
-def row_to_mission(row: sqlite3.Row, db: sqlite3.Connection, detail: bool = False, viewer_org_id: int | None = None) -> dict:
+def row_to_mission(row: sqlite3.Row, db: sqlite3.Connection, detail: bool = False, viewer_org_id: int | None = None, org_cache: dict | None = None) -> dict:
     item = dict(row)
     item["requirements"] = loads(item.pop("requirements", "[]"), [])
     item["plans"] = loads(item.pop("plans", "[]"), [])
     item["preferences"] = loads(item.pop("preferences", "[]"), [])
-    org = db.execute("SELECT * FROM organizations WHERE id=?", (item["requester_org_id"],)).fetchone()
+    org_cache = org_cache if org_cache is not None else {}
+    requester_id = int(item["requester_org_id"])
+    if requester_id not in org_cache:
+        org_cache[requester_id] = db.execute("SELECT * FROM organizations WHERE id=?", (requester_id,)).fetchone()
+    org = org_cache[requester_id]
     item["requester"] = dict(org) if org else None
     full_fairness = org_fairness(org, row, len(item["plans"])) if org else None
     item["fairness"] = {"score": full_fairness["score"]} if full_fairness else None
@@ -1177,7 +1224,8 @@ def get_bootstrap(db: sqlite3.Connection, organization_id: int = 1) -> dict:
         "SELECT DISTINCT m.* FROM missions m LEFT JOIN bookings b ON b.mission_id=m.id LEFT JOIN resources br ON br.id=b.resource_id "
         "WHERE m.requester_org_id=? OR br.owner_org_id=? ORDER BY m.deadline,m.id", (user["id"], user["id"])
     ).fetchall()
-    missions = [row_to_mission(r, db, False, user["id"]) for r in mission_rows]
+    org_cache = {int(r["id"]): r for r in db.execute("SELECT * FROM organizations").fetchall()}
+    missions = [row_to_mission(r, db, False, user["id"], org_cache) for r in mission_rows]
     resource_rows = db.execute(
         "SELECT r.*,o.short_name AS owner_name FROM resources r JOIN organizations o ON o.id=r.owner_org_id "
         "WHERE (r.status='available' AND o.suspended=0) OR r.owner_org_id=? ORDER BY r.status,r.name", (user["id"],)
@@ -1185,7 +1233,7 @@ def get_bootstrap(db: sqlite3.Connection, organization_id: int = 1) -> dict:
     resources = [resource_with_usage(db, r) for r in resource_rows]
     events = [dict(r) for r in db.execute("SELECT id,kind,title,detail,created_at FROM events WHERE audience_org_id=? ORDER BY created_at DESC LIMIT 30", (user["id"],)).fetchall()]
     organizations = [{"id":r["id"],"name":r["name"],"short_name":r["short_name"],"kind":r["kind"]} for r in db.execute("SELECT * FROM organizations ORDER BY name").fetchall()]
-    return {"organization":dict(user),"organizations":organizations,"missions":missions,"resources":resources,"events":events,"history":get_history(db,user["id"],50),"metrics":get_metrics(db,user["id"]),"version":database_version(db)}
+    return {"organization":dict(user),"organizations":organizations,"missions":missions,"resources":resources,"events":events,"history":get_history(db,user["id"],25),"metrics":get_metrics(db,user["id"]),"version":database_version(db)}
 
 
 def calculate_impact(db: sqlite3.Connection, organization_id: int | None = None) -> dict:
@@ -1309,12 +1357,12 @@ def overlap(a1,a2,b1,b2):
     a,b,c,d=map(parse_dt,(a1,a2,b1,b2)); return bool(a and b and c and d and a<d and c<b)
 
 
-def plan_available(db, mission_row, plan, reserved_ids=None):
+def plan_available(db, mission_row, plan, reserved_ids=None, resource_cache=None, booking_cache=None):
     reserved_ids=reserved_ids or set(); ids=set()
     for item in plan.get("items",[]):
         rid=int(item["resource_id"])
         if rid in reserved_ids or rid in ids: return False
-        res=db.execute("SELECT * FROM resources WHERE id=?",(rid,)).fetchone()
+        res = (resource_cache or {}).get(rid) if resource_cache is not None else db.execute("SELECT * FROM resources WHERE id=?",(rid,)).fetchone()
         mission_start, mission_end = parse_dt(mission_row["start_at"]), parse_dt(mission_row["end_at"])
         resource_start, resource_end = parse_dt(res["availability_start"]) if res else None, parse_dt(res["availability_end"]) if res else None
         if not res or res["status"] != "available" or not mission_start or not mission_end or not resource_start or not resource_end or resource_start > mission_start or resource_end < mission_end:
@@ -1322,7 +1370,8 @@ def plan_available(db, mission_row, plan, reserved_ids=None):
         # Compare parsed timestamps instead of ISO strings; this handles UTC
         # offsets consistently in SQLite and Supabase.
         used=0.0
-        for booking in db.execute("SELECT quantity,start_at,end_at FROM bookings WHERE resource_id=? AND status='active'",(rid,)).fetchall():
+        booking_rows = (booking_cache or {}).get(rid, []) if booking_cache is not None else db.execute("SELECT quantity,start_at,end_at FROM bookings WHERE resource_id=? AND status='active'",(rid,)).fetchall()
+        for booking in booking_rows:
             if overlap(booking["start_at"], booking["end_at"], mission_row["start_at"], mission_row["end_at"]):
                 used += float(booking["quantity"] or 0)
         if used + 1 > float(res["capacity"]): return False
@@ -1479,9 +1528,14 @@ def admin_run_batch(db, force: bool = False):
         rows=db.execute("SELECT * FROM missions WHERE status IN ('open','waitlisted') ORDER BY deadline,id").fetchall()
     else:
         rows=db.execute("SELECT * FROM missions WHERE status IN ('open','waitlisted') AND deadline<=? ORDER BY deadline,id",(now.isoformat(),)).fetchall()
+    org_cache = {int(item["id"]): item for item in db.execute("SELECT * FROM organizations").fetchall()}
+    resource_cache = {int(item["id"]): item for item in db.execute("SELECT * FROM resources").fetchall()}
+    booking_cache = {}
+    for item in db.execute("SELECT resource_id,quantity,start_at,end_at FROM bookings WHERE status='active'").fetchall():
+        booking_cache.setdefault(int(item["resource_id"]), []).append(item)
     ranked=[]
     for row in rows:
-        org=db.execute("SELECT * FROM organizations WHERE id=?",(row["requester_org_id"],)).fetchone(); fairness=org_fairness(org,row,len(loads(row["plans"],[])),weights) if org else {"score":0}
+        org=org_cache.get(int(row["requester_org_id"])); fairness=org_fairness(org,row,len(loads(row["plans"],[])),weights) if org else {"score":0}
         ranked.append((fairness["score"],fairness,row))
     ranked.sort(key=lambda x:(-x[0],parse_dt(x[2]["deadline"]) or datetime.max.replace(tzinfo=UTC))); allocated=[];waitlisted=[]
     for score,fairness,row in ranked:
@@ -1489,19 +1543,24 @@ def admin_run_batch(db, force: bool = False):
             record_decision(db,row,fairness,None,"replacement_pending",weights,"An approved resource is unavailable; user confirmation is required before replacement.")
             waitlisted.append({"mission_id":row["id"],"title":row["title"],"fairness":{"score":round(score,3)},"replacement_pending":True})
             continue
-        org=db.execute("SELECT * FROM organizations WHERE id=?",(row["requester_org_id"],)).fetchone()
+        org=org_cache.get(int(row["requester_org_id"]))
         if not org or org["suspended"]: chosen=None
         else:
             plans=loads(row["plans"],[]); prefs=loads(row["preferences"],[]) or [p["id"] for p in plans]
             plan_by_id={p["id"]:p for p in plans}
-            chosen=next((plan_by_id[plan_id] for plan_id in prefs if plan_id in plan_by_id and plan_available(db,row,plan_by_id[plan_id])),None)
+            chosen=next((plan_by_id[plan_id] for plan_id in prefs if plan_id in plan_by_id and plan_available(db,row,plan_by_id[plan_id],resource_cache=resource_cache,booking_cache=booking_cache)),None)
         if not chosen:
             if row["status"]=="open": db.execute("UPDATE organizations SET allocations_lost=allocations_lost+1 WHERE id=?",(row["requester_org_id"],))
             db.execute("UPDATE missions SET status='waitlisted',updated_at=? WHERE id=?",(now_iso(),row["id"]))
             updated=db.execute("SELECT * FROM missions WHERE id=?",(row["id"],)).fetchone()
             add_history(db,"mission",row["id"],row["requester_org_id"],"status_waitlisted",updated)
             waitlisted.append({"mission_id":row["id"],"title":row["title"],"fairness":{"score":round(score,3)}}); record_decision(db,row,fairness,None,"waitlisted",weights,"No preferred plan was feasible after capacity and time-conflict checks."); continue
-        reserve_plan(db,row,chosen); db.execute("UPDATE missions SET status='allocated',allocated_plan_id=?,updated_at=? WHERE id=?",(chosen["id"],now_iso(),row["id"]))
+        reserve_plan(db,row,chosen)
+        # Keep the in-memory availability index consistent within this batch;
+        # otherwise two queued missions could both see the same resource as free.
+        for item in chosen.get("items", []):
+            booking_cache.setdefault(int(item["resource_id"]), []).append({"quantity": 1, "start_at": row["start_at"], "end_at": row["end_at"]})
+        db.execute("UPDATE missions SET status='allocated',allocated_plan_id=?,updated_at=? WHERE id=?",(chosen["id"],now_iso(),row["id"]))
         updated=db.execute("SELECT * FROM missions WHERE id=?",(row["id"],)).fetchone()
         db.execute("UPDATE organizations SET allocations_won=allocations_won+1 WHERE id=?",(row["requester_org_id"],)); add_event(db,"allocation","Mission approved",f"{row['title']} received an approved plan.",row["requester_org_id"])
         for provider_id in sorted({int(item["owner_org_id"]) for item in chosen.get("items",[]) if item.get("owner_org_id")}):
