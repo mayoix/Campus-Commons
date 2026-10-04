@@ -2,6 +2,8 @@
 
 **Live demo: [https://campus-commons.onrender.com](https://campus-commons.onrender.com)**
 
+**Demo video: [Watch on YouTube](https://youtu.be/IVCeQiwn0Co)**
+
 **2026 Hackathon HackU · Team She++**
 
 **Financial Technology Problem 2 — Recognise Value That Gets Overlooked**
