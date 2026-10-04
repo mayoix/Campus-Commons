@@ -356,10 +356,10 @@ async function openAdminConsole() {
     adminHost.innerHTML = shell.outerHTML;
     document.body.appendChild(adminHost);
     if (!document.querySelector('link[data-admin-css]')) {
-      const style = document.createElement('link'); style.rel = 'stylesheet'; style.href = '/static/admin.css?v=20261004perf1'; style.dataset.adminCss = '1'; document.head.appendChild(style);
+      const style = document.createElement('link'); style.rel = 'stylesheet'; style.href = '/static/admin.css?v=20261004overlay1'; style.dataset.adminCss = '1'; document.head.appendChild(style);
     }
     window.closeAdminConsole = () => { window.stopAdminSync?.(); adminHost?.remove(); adminHost = null; delete window.closeAdminConsole; };
-    const script = document.createElement('script'); script.src = '/static/admin.js?overlay=20261004perf1'; adminHost.appendChild(script);
+    const script = document.createElement('script'); script.src = '/static/admin.js?overlay=20261004overlay1'; adminHost.appendChild(script);
   } catch (error) { toast(error.message, true); }
 }
 async function refresh() {
