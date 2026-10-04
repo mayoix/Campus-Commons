@@ -66,7 +66,7 @@ No real users have validated cost or coordination savings. Impact values use dem
 
 ## Engineering verification
 
-See [README validation](../README.md#validation-and-troubleshooting). The current 21-test suite covers adapters, transaction lifecycle, launcher/diagnostic behavior, serializer equivalence, query-count stability and isolated reports. Local HTTP verification covered a complete resource-to-Mission-to-allocation path. These engineering checks and live evaluation instructions support review but do not substitute for a real-user study or production concurrency evaluation.
+See [README validation](../README.md#validation-and-troubleshooting). The current 24-test suite covers adapters, transaction lifecycle, launcher/diagnostic behavior, serializer equivalence, query-count stability and isolated reports. Local HTTP verification covered a complete resource-to-Mission-to-allocation path. These engineering checks and live evaluation instructions support review but do not substitute for a real-user study or production concurrency evaluation.
 
 ## Recorded local business-flow verification
 

@@ -76,7 +76,7 @@ Choose **Missions → Submit a Mission**. Enter a title, a description of the ne
 
 The backend uses deterministic keyword rules, not an LLM, to parse requirements. It checks resource type, capability fit, the requested time window and remaining booking capacity, then proposes up to five complete plans. Each plan must contain every parsed requirement. If no complete plan is feasible, the Mission has no valid options; it does not mean that resources have been reserved.
 
-Open **View details**, select acceptable plans, reorder them and **Save option preferences**. Submission and preference saving do not create bookings. The default cutoff is **usage start minus 24 hours**; API clients may supply a custom cutoff before usage start. The normal user form uses the default.
+Open **View details**, select acceptable plans, reorder them and **Save option preferences**. Submission and preference saving do not create bookings. Restarting the backend preserves saved resource combinations and preference IDs. An unavailable accepted plan is skipped during allocation; it is not silently reassigned to another resource. If a Mission previously had no plans and startup finds new options, they require requester confirmation before allocation. The default cutoff is **usage start minus 24 hours**; API clients may supply a custom cutoff before usage start. The normal user form uses the default.
 
 ### Allocation, use and completion
 
@@ -241,7 +241,7 @@ python3 -m pip install -r requirements.txt
 python3 -m unittest discover -s tests -v
 ```
 
-The current suite has **21 tests** covering launcher behavior, credential-safe diagnostic failures, pool commit/rollback, PostgreSQL row compatibility, serializer equivalence and isolated teaching reports. A query-count regression keeps user bootstrap at **20 queries** even after adding 40 resources and 40 Missions. A comparison against `fdfb903` on that fixture reduced user/admin bootstrap queries from 115/158 to 20/25; these are query counts, not production timing guarantees.
+The current suite has **24 tests** covering launcher behavior, credential-safe diagnostic failures, pool commit/rollback, PostgreSQL row compatibility, serializer equivalence and isolated teaching reports. A query-count regression keeps user bootstrap at **20 queries** even after adding 40 resources and 40 Missions. A comparison against `fdfb903` on that fixture reduced user/admin bootstrap queries from 115/158 to 20/25; these are query counts, not production timing guarantees.
 
 Local HTTP checks exercised organization switching, resource publishing, Mission submission, manual allocation and admin/version reads. Two additional fresh-database business cases verified capacity-one competition and withdrawal followed by waitlist allocation; [recorded results](docs/REQUIREMENTS_AND_EVIDENCE.md#recorded-local-business-flow-verification) distinguish these from teaching frames. Browser checks verified the opaque admin overlay and return to the user interface. These do not establish successful production Supabase connectivity or real-user economic outcomes.
 

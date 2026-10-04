@@ -900,17 +900,27 @@ def build_plans(db: sqlite3.Connection, requirements: list[dict], location: str,
 
 
 def refresh_open_mission_plans(db: sqlite3.Connection) -> None:
-    """Rebuild plans created by older releases using the current matcher."""
+    """Keep saved plans immutable; newly recovered options need confirmation."""
     rows = db.execute("SELECT * FROM missions WHERE status IN ('open','waitlisted')").fetchall()
     for row in rows:
+        # plan-N identifies a saved resource combination, not a fresh ranking.
+        # Rebuilding it can silently transfer consent to different resources.
+        # Allocation rechecks availability, so infeasible saved plans can stay.
+        if loads(row["plans"], []):
+            continue
         requirements = loads(row["requirements"], [])
         if not requirements:
             requirements = parse_requirements(f'{row["title"]} {row["description"]}')
         plans = build_plans(db, requirements, row["location"], row["start_at"], row["end_at"], row["requester_org_id"])
-        valid = {plan["id"] for plan in plans}
-        old_preferences = loads(row["preferences"], [])
-        preferences = [plan_id for plan_id in old_preferences if plan_id in valid] or [plan["id"] for plan in plans]
-        db.execute("UPDATE missions SET requirements=?,plans=?,preferences=?,updated_at=? WHERE id=?", (dumps(requirements), dumps(plans), dumps(preferences), now_iso(), row["id"]))
+        if not plans:
+            continue
+        db.execute(
+            "UPDATE missions SET requirements=?,plans=?,preferences='[]',replacement_pending=1,updated_at=? WHERE id=?",
+            (dumps(requirements), dumps(plans), now_iso(), row["id"]),
+        )
+        updated = db.execute("SELECT * FROM missions WHERE id=?", (row["id"],)).fetchone()
+        add_event(db, "replacement", "New plans await your confirmation", row["title"], row["requester_org_id"])
+        add_history(db, "mission", row["id"], row["requester_org_id"], "plans_confirmation_required", updated)
 
 
 def org_fairness(org: sqlite3.Row, mission: sqlite3.Row, plan_count: int, weights: dict | None = None) -> dict:
