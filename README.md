@@ -294,15 +294,4 @@ Runtime entrypoints remain at the root so Render, launchers and imports retain t
 
 ## Team
 
-2026 Hackathon HackU
-
-| Team name |
-| --- |
-| She++ |
-
-| Team members |
-| --- |
-| ZHENG Ruixue |
-| ZHU Yining |
-| SUN ZI DAN |
-| TANG Tian Yi |
+2026 Hackathon HackU · Team She++ · ZHENG Ruixue · ZHU Yining · SUN ZI DAN · TANG Tian Yi
