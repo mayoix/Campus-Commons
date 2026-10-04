@@ -17,11 +17,11 @@
   }
   async function load() { state.data = await api("/api/admin/bootstrap"); $("admin-login").hidden = true; $("admin-app").hidden = false; $("admin-logout").hidden = false; $("admin-session-label").textContent = `Admin · ${fmtDate(new Date().toISOString())}`; render(); startSync(); }
   async function sync() {
-    if (!state.data || syncBusy || player.playing || $("demo-stage")?.classList.contains("demo-presentation")) return;
+    if (!state.data || document.hidden || syncBusy || player.playing || $("demo-stage")?.classList.contains("demo-presentation")) return;
     syncBusy = true;
     try {
-      const next = await api("/api/admin/bootstrap");
-      if (next.version !== state.data.version) { state.data = next; render(); }
+      const version = await api("/api/version");
+      if (version.version !== state.data.version) { state.data = await api("/api/admin/bootstrap"); render(); }
     } catch (_) {
       // Keep the management console usable during a transient polling failure.
     } finally { syncBusy = false; }

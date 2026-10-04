@@ -14,6 +14,9 @@ import os
 import re
 import sqlite3
 import threading
+import time
+from functools import wraps
+from contextlib import nullcontext
 import secrets
 import hashlib
 import shutil
@@ -46,6 +49,7 @@ UTC = timezone.utc
 DB_LOCK = threading.RLock()
 _CLOUD_POOL = None
 _CLOUD_POOL_DSN = None
+_POOL_LOCK = threading.Lock()
 USER_SESSIONS: dict[str, int] = {}
 ADMIN_SESSIONS: set[str] = set()
 ADMIN_PASSWORD_PATH = ROOT / ".admin-password"
@@ -112,6 +116,12 @@ def loads(value, default):
         return default
 
 
+def scalar(row):
+    if row is None: return 0
+    if isinstance(row, dict): return next(iter(row.values()), 0)
+    return row[0]
+
+
 class CloudCursor:
     """Small psycopg adapter for the existing SQLite-shaped query code."""
     def __init__(self, cursor):
@@ -157,6 +167,13 @@ class CompatRow(dict):
         return super().__getitem__(key)
 
 
+def configure_cloud_connection(conn):
+    # Use SQL instead of startup "options", which some pooler endpoints reject.
+    conn.execute("SET statement_timeout = '20s'")
+    conn.execute("SET lock_timeout = '5s'")
+    conn.commit()
+
+
 class CloudConnection:
     """SQLite-shaped adapter backed by a shared psycopg connection pool.
 
@@ -168,18 +185,19 @@ class CloudConnection:
         global _CLOUD_POOL, _CLOUD_POOL_DSN
         if psycopg is None or ConnectionPool is None:
             raise RuntimeError("Supabase is configured, but psycopg[binary] and psycopg_pool are required. Run: python3 -m pip install 'psycopg[binary]' psycopg_pool")
-        with DB_LOCK:
+        with _POOL_LOCK:
             if _CLOUD_POOL is None or _CLOUD_POOL_DSN != dsn:
                 if _CLOUD_POOL is not None:
                     _CLOUD_POOL.close()
                 _CLOUD_POOL = ConnectionPool(
                     conninfo=dsn, min_size=1, max_size=int(os.environ.get("SUPABASE_POOL_MAX", "10")),
-                    timeout=15, open=False, kwargs={"connect_timeout": 15, "row_factory": dict_row}
+                    timeout=15, open=False, configure=configure_cloud_connection,
+                    kwargs={"connect_timeout": 10, "row_factory": dict_row, "prepare_threshold": None}
                 )
                 _CLOUD_POOL.open(wait=True)
                 _CLOUD_POOL_DSN = dsn
             self._pool = _CLOUD_POOL
-            self._conn = self._pool.getconn(timeout=15)
+        self._conn = self._pool.getconn(timeout=15)
         self._closed = False
 
     def execute(self, statement, params=None):
@@ -392,6 +410,8 @@ def init_db() -> None:
             db.execute("INSERT INTO admin_config(id,weights) VALUES(1,?) ON CONFLICT (id) DO NOTHING", (dumps({"urgency":.3,"contribution":.2,"credit":.15,"access_fairness":.2,"alternative_scarcity":.15}),))
             if db.execute("SELECT COUNT(*) AS count FROM organizations").fetchone()["count"] == 0:
                 seed_db(db)
+            for statement in (ROOT / "scripts" / "performance_indexes.sql").read_text().split(";"):
+                if statement.strip(): db.execute(statement)
             refresh_open_mission_plans(db)
             for m in db.execute("SELECT * FROM missions WHERE status IN ('allocated','in_use','completed') AND allocated_plan_id IS NOT NULL").fetchall():
                 for item in next((p for p in loads(m["plans"],[]) if p.get("id")==m["allocated_plan_id"]),{}).get("items",[]):
@@ -437,7 +457,7 @@ def init_db() -> None:
         add_column("decisions", "explanation", "TEXT NOT NULL DEFAULT ''")
         add_column("decisions", "policy_snapshot", "TEXT NOT NULL DEFAULT '{}'")
         db.execute("INSERT OR IGNORE INTO admin_config(id,weights) VALUES(1,?)", (dumps({"urgency":.3,"contribution":.2,"credit":.15,"access_fairness":.2,"alternative_scarcity":.15}),))
-        if db.execute("SELECT COUNT(*) FROM organizations").fetchone()[0] == 0:
+        if scalar(db.execute("SELECT COUNT(*) FROM organizations").fetchone()) == 0:
             seed_db(db)
         refresh_open_mission_plans(db)
         # Backfill bookings for the original MVP's allocated sample mission once.
@@ -593,12 +613,13 @@ def get_history(db: sqlite3.Connection, organization_id: int | None = None, limi
 
 
 def database_version(db: sqlite3.Connection) -> str:
-    """Return a cheap change token shared by the user and admin clients."""
-    parts = []
-    for table in ("history_log", "events", "decisions", "demo_runs", "disputes", "resources", "missions"):
-        row = db.execute(f"SELECT COUNT(*) AS count, COALESCE(MAX(id),0) AS max_id FROM {table}").fetchone()
-        parts.append(f"{table}:{row['count']}:{row['max_id']}")
-    return "|".join(parts)
+    """Read the persistent change token in a single database round trip."""
+    tables = ("history_log", "events", "decisions", "demo_runs", "disputes", "resources", "missions")
+    query = " UNION ALL ".join(
+        f"SELECT '{table}' AS table_name, COUNT(*) AS count, COALESCE(MAX(id),0) AS max_id FROM {table}"
+        for table in tables
+    )
+    return "|".join(f"{r['table_name']}:{r['count']}:{r['max_id']}" for r in db.execute(query).fetchall())
 
 
 def record_decision(db: sqlite3.Connection, mission: sqlite3.Row, fairness: dict, chosen_plan: dict | None, outcome: str, weights: dict, explanation: str) -> None:
@@ -921,20 +942,20 @@ def row_to_resource(row: sqlite3.Row) -> dict:
     return item
 
 
-def row_to_dispute(row: sqlite3.Row, db: sqlite3.Connection, include_evidence: bool = True) -> dict:
+def row_to_dispute(row: sqlite3.Row, db: sqlite3.Connection, include_evidence: bool = True, org_cache=None) -> dict:
     item = dict(row)
     item["evidence"] = loads(item.get("evidence", "[]"), []) if include_evidence else []
     for index, evidence in enumerate(item["evidence"]):
         if evidence.get("storage") == "supabase" and evidence.get("path"):
             evidence["endpoint"] = f"/api/admin/disputes/{item['id']}/evidence/{index}"
-    reporter = db.execute("SELECT id, name, short_name FROM organizations WHERE id=?", (item.get("reporter_org_id"),)).fetchone()
-    accused = db.execute("SELECT id, name, short_name, credit_score, suspended FROM organizations WHERE id=?", (item.get("accused_org_id"),)).fetchone() if item.get("accused_org_id") else None
-    item["reporter"] = dict(reporter) if reporter else None
-    item["accused"] = dict(accused) if accused else None
+    reporter = org_cache.get(int(item["reporter_org_id"])) if org_cache is not None else db.execute("SELECT id, name, short_name FROM organizations WHERE id=?", (item.get("reporter_org_id"),)).fetchone()
+    accused = (org_cache.get(int(item["accused_org_id"])) if org_cache is not None else db.execute("SELECT id, name, short_name, credit_score, suspended FROM organizations WHERE id=?", (item.get("accused_org_id"),)).fetchone()) if item.get("accused_org_id") else None
+    item["reporter"] = {k:reporter[k] for k in ("id","name","short_name")} if reporter else None
+    item["accused"] = {k:accused[k] for k in ("id","name","short_name","credit_score","suspended")} if accused else None
     return item
 
 
-def mission_allocation_details(db: sqlite3.Connection, row: sqlite3.Row) -> list[dict]:
+def mission_allocation_details(db: sqlite3.Connection, row: sqlite3.Row, booking_cache=None) -> list[dict]:
     """Return the exact resources reserved by the approved plan."""
     plan_id = row["allocated_plan_id"]
     if not plan_id:
@@ -942,7 +963,7 @@ def mission_allocation_details(db: sqlite3.Connection, row: sqlite3.Row) -> list
     plan = next((p for p in loads(row["plans"], []) if p.get("id") == plan_id), None)
     if not plan:
         return []
-    bookings = {
+    bookings = booking_cache.get(int(row["id"]), {}) if booking_cache is not None else {
         int(item["resource_id"]): dict(item)
         for item in db.execute(
             "SELECT b.resource_id,b.status AS booking_status,b.start_at AS booking_start,b.end_at AS booking_end,r.name,r.type,r.location,r.owner_org_id,o.short_name AS owner_name "
@@ -957,7 +978,26 @@ def mission_allocation_details(db: sqlite3.Connection, row: sqlite3.Row) -> list
     return result
 
 
-def row_to_mission(row: sqlite3.Row, db: sqlite3.Connection, detail: bool = False, viewer_org_id: int | None = None, org_cache: dict | None = None) -> dict:
+def missions_for_client(db, rows, detail=False, viewer_org_id=None):
+    rows = list(rows)
+    if not rows:
+        return []
+    orgs = {int(r["id"]): r for r in db.execute("SELECT * FROM organizations").fetchall()}
+    bookings = {}
+    for r in db.execute(
+        "SELECT b.mission_id,b.resource_id,b.status AS booking_status,b.start_at AS booking_start,"
+        "b.end_at AS booking_end,r.name,r.type,r.location,r.owner_org_id,o.short_name AS owner_name "
+        "FROM bookings b JOIN resources r ON r.id=b.resource_id JOIN organizations o ON o.id=r.owner_org_id"
+    ).fetchall():
+        bookings.setdefault(int(r["mission_id"]), {})[int(r["resource_id"])] = dict(r)
+    disputes = {}
+    if detail:
+        for r in db.execute("SELECT * FROM disputes ORDER BY id DESC").fetchall():
+            disputes.setdefault(int(r["mission_id"]), []).append(row_to_dispute(r, db, org_cache=orgs))
+    return [row_to_mission(r, db, detail, viewer_org_id, orgs, bookings, disputes) for r in rows]
+
+
+def row_to_mission(row: sqlite3.Row, db: sqlite3.Connection, detail: bool = False, viewer_org_id: int | None = None, org_cache: dict | None = None, booking_cache=None, dispute_cache=None) -> dict:
     item = dict(row)
     item["requirements"] = loads(item.pop("requirements", "[]"), [])
     item["plans"] = loads(item.pop("plans", "[]"), [])
@@ -970,13 +1010,13 @@ def row_to_mission(row: sqlite3.Row, db: sqlite3.Connection, detail: bool = Fals
     item["requester"] = dict(org) if org else None
     full_fairness = org_fairness(org, row, len(item["plans"])) if org else None
     item["fairness"] = {"score": full_fairness["score"]} if full_fairness else None
-    allocated = mission_allocation_details(db, row)
+    allocated = mission_allocation_details(db, row, booking_cache)
     item["allocated_resources"] = allocated
     item["viewer_role"] = "requester" if viewer_org_id is not None and int(viewer_org_id) == int(item["requester_org_id"]) else None
     if viewer_org_id is not None and item["viewer_role"] is None and any(int(resource.get("owner_org_id")) == int(viewer_org_id) for resource in allocated):
         item["viewer_role"] = "provider"
     if detail:
-        item["disputes"] = [row_to_dispute(dispute, db, include_evidence=True) for dispute in db.execute("SELECT * FROM disputes WHERE mission_id=? ORDER BY id DESC", (item["id"],)).fetchall()]
+        item["disputes"] = dispute_cache.get(int(item["id"]), []) if dispute_cache is not None else [row_to_dispute(dispute, db, include_evidence=True) for dispute in db.execute("SELECT * FROM disputes WHERE mission_id=? ORDER BY id DESC", (item["id"],)).fetchall()]
     if not detail:
         item["description"] = item["description"][:140]
     return item
@@ -1003,6 +1043,25 @@ def cookie_value(handler, name: str) -> str | None:
 
 def origin_ok(handler):
     return True
+
+
+def api_request(method):
+    """Return safe failures and log slow API paths without request contents."""
+    @wraps(method)
+    def handle(self):
+        started = time.monotonic()
+        try:
+            return method(self)
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        except Exception as exc:
+            print(f"API failure {self.command} {urlparse(self.path).path}: {type(exc).__name__}", flush=True)
+            self.send_json({"error": "Database request failed. Please retry shortly."}, 503)
+        finally:
+            elapsed = time.monotonic() - started
+            if elapsed >= 1 and self.path.startswith("/api/"):
+                print(f"Slow API {self.command} {urlparse(self.path).path}: {elapsed:.2f}s", flush=True)
+    return handle
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1057,9 +1116,7 @@ class Handler(BaseHTTPRequestHandler):
             session_sql = ("INSERT INTO user_sessions(session_id,organization_id,created_at,last_seen) VALUES(?,?,?,?) ON CONFLICT (session_id) DO UPDATE SET organization_id=EXCLUDED.organization_id, created_at=EXCLUDED.created_at, last_seen=EXCLUDED.last_seen" if DB_BACKEND == "supabase" else "INSERT OR REPLACE INTO user_sessions(session_id,organization_id,created_at,last_seen) VALUES(?,?,?,?)")
             db.execute(session_sql, (token, row["id"], now_iso(), now_iso()))
             self._cookies = getattr(self, "_cookies", []) + [f"user_sid={token}; HttpOnly; SameSite=Strict; Path=/"]
-        elif org_id:
-            db.execute("UPDATE user_sessions SET last_seen=? WHERE session_id=?", (now_iso(), token))
-        db.commit()
+            db.commit()
         return row
 
     def admin_ok(self) -> bool:
@@ -1071,6 +1128,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": "Origin is not allowed"}, HTTPStatus.FORBIDDEN); return True
         return False
 
+    @api_request
     def do_GET(self):
         parsed = urlparse(self.path); path = parsed.path
         if path == "/" or path == "/index.html": self.send_file(STATIC_DIR / "index.html"); return
@@ -1080,7 +1138,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_file(STATIC_DIR / "index.html"); return
         if path.startswith("/static/"):
             self.send_file(STATIC_DIR / path.removeprefix("/static/")); return
-        with DB_LOCK, connect() as db:
+        with (DB_LOCK if DB_BACKEND == "sqlite" else nullcontext()), connect() as db:
+            if path == "/api/version":
+                self.send_json({"version": database_version(db)}); return
             if path == "/api/bootstrap":
                 org = self.user_org(db); self.send_json(get_bootstrap(db, org["id"])); return
             if path == "/api/organizations":
@@ -1130,6 +1190,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json({"error": f"Evidence unavailable: {exc}"}, 502); return
         self.send_error(HTTPStatus.NOT_FOUND)
 
+    @api_request
     def do_POST(self):
         path=urlparse(self.path).path; body=json_body(self)
         if self.reject_origin(): return
@@ -1179,9 +1240,10 @@ class Handler(BaseHTTPRequestHandler):
                     if not self.admin_ok(): self.send_json({"error":"Admin authentication required"},401); return
                     self.send_json(resolve_dispute(db,int(m.group(1)),body)); return
         except ValueError as exc: self.send_json({"error":str(exc)},400); return
-        except Exception as exc: self.send_json({"error":f"Server error: {exc}"},500); return
+        except Exception: raise
         self.send_error(HTTPStatus.NOT_FOUND)
 
+    @api_request
     def do_PATCH(self):
         path=urlparse(self.path).path; body=json_body(self)
         if self.reject_origin(): return
@@ -1202,12 +1264,25 @@ class Handler(BaseHTTPRequestHandler):
                     if not self.admin_ok(): self.send_json({"error":"Admin authentication required"},401); return
                     self.send_json(update_config(db,body)); return
         except ValueError as exc: self.send_json({"error":str(exc)},400); return
-        except Exception as exc: self.send_json({"error":f"Server error: {exc}"},500); return
+        except Exception: raise
         self.send_error(HTTPStatus.NOT_FOUND)
 
-def resource_with_usage(db: sqlite3.Connection, row: sqlite3.Row) -> dict:
+def resources_with_usage(db, rows):
+    loans = {}
+    for r in db.execute(
+        "SELECT b.resource_id,b.id AS booking_id,b.status AS booking_status,b.start_at,b.end_at,"
+        "m.id AS mission_id,m.title,m.requester_org_id,o.short_name AS requester_name "
+        "FROM bookings b JOIN missions m ON m.id=b.mission_id "
+        "JOIN organizations o ON o.id=m.requester_org_id WHERE b.status='active' ORDER BY b.start_at"
+    ).fetchall():
+        item = dict(r); rid = int(item.pop("resource_id"))
+        loans.setdefault(rid, []).append(item)
+    return [resource_with_usage(db, r, loans) for r in rows]
+
+
+def resource_with_usage(db: sqlite3.Connection, row: sqlite3.Row, loan_cache=None) -> dict:
     item = row_to_resource(row)
-    item["active_loans"] = [dict(loan) for loan in db.execute(
+    item["active_loans"] = loan_cache.get(int(row["id"]), []) if loan_cache is not None else [dict(loan) for loan in db.execute(
         "SELECT b.id AS booking_id,b.status AS booking_status,b.start_at,b.end_at,m.id AS mission_id,m.title,m.requester_org_id,o.short_name AS requester_name "
         "FROM bookings b JOIN missions m ON m.id=b.mission_id JOIN organizations o ON o.id=m.requester_org_id "
         "WHERE b.resource_id=? AND b.status='active' ORDER BY b.start_at", (row["id"],)
@@ -1224,13 +1299,12 @@ def get_bootstrap(db: sqlite3.Connection, organization_id: int = 1) -> dict:
         "SELECT DISTINCT m.* FROM missions m LEFT JOIN bookings b ON b.mission_id=m.id LEFT JOIN resources br ON br.id=b.resource_id "
         "WHERE m.requester_org_id=? OR br.owner_org_id=? ORDER BY m.deadline,m.id", (user["id"], user["id"])
     ).fetchall()
-    org_cache = {int(r["id"]): r for r in db.execute("SELECT * FROM organizations").fetchall()}
-    missions = [row_to_mission(r, db, False, user["id"], org_cache) for r in mission_rows]
+    missions = missions_for_client(db, mission_rows, viewer_org_id=user["id"])
     resource_rows = db.execute(
         "SELECT r.*,o.short_name AS owner_name FROM resources r JOIN organizations o ON o.id=r.owner_org_id "
         "WHERE (r.status='available' AND o.suspended=0) OR r.owner_org_id=? ORDER BY r.status,r.name", (user["id"],)
     ).fetchall()
-    resources = [resource_with_usage(db, r) for r in resource_rows]
+    resources = resources_with_usage(db, resource_rows)
     events = [dict(r) for r in db.execute("SELECT id,kind,title,detail,created_at FROM events WHERE audience_org_id=? ORDER BY created_at DESC LIMIT 30", (user["id"],)).fetchall()]
     organizations = [{"id":r["id"],"name":r["name"],"short_name":r["short_name"],"kind":r["kind"]} for r in db.execute("SELECT * FROM organizations ORDER BY name").fetchall()]
     return {"organization":dict(user),"organizations":organizations,"missions":missions,"resources":resources,"events":events,"history":get_history(db,user["id"],25),"metrics":get_metrics(db,user["id"]),"version":database_version(db)}
@@ -1271,7 +1345,7 @@ def calculate_impact(db: sqlite3.Connection, organization_id: int | None = None)
 
 def get_metrics(db: sqlite3.Connection, organization_id: int | None = None) -> dict:
     own = (" AND owner_org_id=?", (organization_id,)) if organization_id else ("", ())
-    resource_count = db.execute(f"SELECT COUNT(*) FROM resources WHERE status='available'{own[0]}", own[1]).fetchone()[0]
+    resource_count = scalar(db.execute(f"SELECT COUNT(*) FROM resources WHERE status='available'{own[0]}", own[1]).fetchone())
     active_hours=0.0
     for r in db.execute(f"SELECT availability_start,availability_end FROM resources WHERE status='available'{own[0]}", own[1]).fetchall():
         a,b=parse_dt(r["availability_start"]),parse_dt(r["availability_end"])
@@ -1281,8 +1355,9 @@ def get_metrics(db: sqlite3.Connection, organization_id: int | None = None) -> d
     else: missions=db.execute("SELECT * FROM missions").fetchall()
     successful=sum(1 for m in missions if m["status"] in ("allocated","in_use","completed"))
     scores=[]
+    orgs = {int(r["id"]): r for r in db.execute("SELECT * FROM organizations").fetchall()}
     for m in missions:
-        org=db.execute("SELECT * FROM organizations WHERE id=?",(m["requester_org_id"],)).fetchone()
+        org=orgs.get(int(m["requester_org_id"]))
         if org: scores.append(org_fairness(org,m,len(loads(m["plans"],[])))["score"])
     if organization_id:
         completed=db.execute("SELECT b.*,r.owner_org_id,r.external_hourly_cost,m.requester_org_id FROM bookings b JOIN resources r ON r.id=b.resource_id JOIN missions m ON m.id=b.mission_id WHERE b.status='completed' AND m.requester_org_id=?",(organization_id,)).fetchall()
@@ -1296,7 +1371,7 @@ def get_metrics(db: sqlite3.Connection, organization_id: int | None = None) -> d
     concentration=(len(providers)/len(completed)) if completed else 0.0
     decision_scores=[float(row["fairness_score"]) for row in decisions if row["fairness_score"] is not None]
     impact = calculate_impact(db, organization_id)
-    platform_impact = calculate_impact(db)
+    platform_impact = calculate_impact(db) if organization_id is not None else impact
     return {"resource_count":resource_count,"active_hours":round(active_hours,1),"missions":len(missions),"allocation_success_rate":round(successful/max(1,len(missions)),2),"first_choice_satisfaction":round(len(first_choice)/max(1,len([row for row in decisions if row["outcome"] == "allocated"])),2),"resource_concentration":round(concentration,2),"estimated_cost_saved":round(estimated_cost_saved,2),"fairness_index":round(sum(decision_scores)/max(1,len(decision_scores)),2) if decision_scores else round(sum(scores)/max(1,len(scores)),2),"impact":impact,"platform_impact":platform_impact}
 
 
@@ -1628,13 +1703,14 @@ def update_config(db, body):
 
 
 def get_admin_bootstrap(db):
+    org_cache = {int(r["id"]): r for r in db.execute("SELECT * FROM organizations").fetchall()}
     config=dict(db.execute("SELECT * FROM admin_config WHERE id=1").fetchone()); config["weights"]=loads(config.get("weights"),{})
     demo_runs=[]
-    for row in db.execute("SELECT * FROM demo_runs ORDER BY id DESC"):
+    for row in db.execute("SELECT * FROM demo_runs ORDER BY id DESC LIMIT 10"):
         item=dict(row)
         item["report"]=dumps(translate_demo_value(loads(item.get("report"),{})))
         demo_runs.append(item)
-    return {"organizations":[dict(r) for r in db.execute("SELECT * FROM organizations ORDER BY name")],"resources":[row_to_resource(r) for r in db.execute("SELECT r.*,o.short_name AS owner_name FROM resources r JOIN organizations o ON o.id=r.owner_org_id ORDER BY r.id")],"missions":[row_to_mission(r,db,True) for r in db.execute("SELECT * FROM missions ORDER BY id")],"events":[dict(r) for r in db.execute("SELECT * FROM events ORDER BY created_at DESC")],"history":get_history(db),"credit_events":[dict(r) for r in db.execute("SELECT * FROM credit_events ORDER BY id DESC LIMIT 200")],"contribution_events":[dict(r) for r in db.execute("SELECT * FROM contribution_events ORDER BY id DESC LIMIT 200")],"decisions":[dict(r) for r in db.execute("SELECT * FROM decisions ORDER BY id DESC")],"bookings":[dict(r) for r in db.execute("SELECT * FROM bookings ORDER BY id")],"config":config,"demo_runs":demo_runs,"disputes":[row_to_dispute(r,db) for r in db.execute("SELECT * FROM disputes ORDER BY id DESC")],"metrics":get_metrics(db),"cloud":{"provider":"Supabase","database_backend":DB_BACKEND,"database_shared":DB_BACKEND == "supabase","evidence_configured":cloud_evidence_enabled(),"evidence_bucket":SUPABASE_EVIDENCE_BUCKET if cloud_evidence_enabled() else None},"version":database_version(db)}
+    return {"organizations":[dict(r) for r in db.execute("SELECT * FROM organizations ORDER BY name")],"resources":[row_to_resource(r) for r in db.execute("SELECT r.*,o.short_name AS owner_name FROM resources r JOIN organizations o ON o.id=r.owner_org_id ORDER BY r.id")],"missions":missions_for_client(db, db.execute("SELECT * FROM missions ORDER BY id"), detail=True),"events":[dict(r) for r in db.execute("SELECT * FROM events ORDER BY created_at DESC LIMIT 200")],"history":get_history(db),"credit_events":[dict(r) for r in db.execute("SELECT * FROM credit_events ORDER BY id DESC LIMIT 200")],"contribution_events":[dict(r) for r in db.execute("SELECT * FROM contribution_events ORDER BY id DESC LIMIT 200")],"decisions":[dict(r) for r in db.execute("SELECT * FROM decisions ORDER BY id DESC")],"bookings":[dict(r) for r in db.execute("SELECT * FROM bookings ORDER BY id")],"config":config,"demo_runs":demo_runs,"disputes":[row_to_dispute(r,db,org_cache=org_cache) for r in db.execute("SELECT * FROM disputes ORDER BY id DESC")],"metrics":get_metrics(db),"cloud":{"provider":"Supabase","database_backend":DB_BACKEND,"database_shared":DB_BACKEND == "supabase","evidence_configured":cloud_evidence_enabled(),"evidence_bucket":SUPABASE_EVIDENCE_BUCKET if cloud_evidence_enabled() else None},"version":database_version(db)}
 
 
 def admin_mission_action(db, mission_id, action, body=None):

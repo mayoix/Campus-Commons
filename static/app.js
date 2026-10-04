@@ -356,10 +356,10 @@ async function openAdminConsole() {
     adminHost.innerHTML = shell.outerHTML;
     document.body.appendChild(adminHost);
     if (!document.querySelector('link[data-admin-css]')) {
-      const style = document.createElement('link'); style.rel = 'stylesheet'; style.href = '/static/admin.css?v=v3-update1'; style.dataset.adminCss = '1'; document.head.appendChild(style);
+      const style = document.createElement('link'); style.rel = 'stylesheet'; style.href = '/static/admin.css?v=20261004perf1'; style.dataset.adminCss = '1'; document.head.appendChild(style);
     }
     window.closeAdminConsole = () => { window.stopAdminSync?.(); adminHost?.remove(); adminHost = null; delete window.closeAdminConsole; };
-    const script = document.createElement('script'); script.src = '/static/admin.js?overlay=v3-update1'; adminHost.appendChild(script);
+    const script = document.createElement('script'); script.src = '/static/admin.js?overlay=20261004perf1'; adminHost.appendChild(script);
   } catch (error) { toast(error.message, true); }
 }
 async function refresh() {
@@ -370,11 +370,12 @@ async function refresh() {
   startUserSync();
 }
 async function syncUserData() {
-  if (!state.data || userSyncBusy) return;
+  if (!state.data || userSyncBusy || document.hidden || adminHost) return;
   userSyncBusy = true;
   try {
-    const next = await api('/api/bootstrap');
-    if (next.version !== state.data.version) {
+    const version = await api('/api/version');
+    if (version.version !== state.data.version) {
+      const next = await api('/api/bootstrap');
       state.data = next;
       $('#org-name').textContent = next.organization?.short_name || next.organization?.name || 'my organization';
       $('#org-avatar').textContent = (next.organization?.short_name || next.organization?.name || '—')[0];

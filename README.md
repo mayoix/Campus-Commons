@@ -631,3 +631,15 @@ Potential extensions:
 # License
 
 This project is developed as a hackathon MVP.
+
+## Hosted performance fix (based on fdfb903)
+
+Render and local cloud startup now use the same pooled adapter, including SQLite-compatible row indexing. This fixes `KeyError: 0` when reading PostgreSQL aggregate counts. `requirements-cloud.txt` installs the pool dependency for double-click startup too.
+
+User and admin background sync first call `/api/version` (one database query), and only reload the full snapshot when persistent data changes. Hidden tabs pause polling; user polling also pauses while the admin overlay is open. Cloud GET requests use independent pooled transactions instead of waiting on the allocation/write lock. Established sessions no longer write `last_seen` on every read; sessions currently have no inactivity expiry policy.
+
+Resource loans, Mission booking details, organization lookups and fairness metrics are read in batches. Hosted startup applies `scripts/performance_indexes.sql` automatically. Admin snapshots retain the latest 10 demo reports and 200 events; business records are retained in the database. Slow API calls log their path and elapsed time, with no payloads or credentials; unexpected API failures return a safe JSON error instead of dropping the request.
+
+Validation: 21 offline regression tests pass, including pooled commit/rollback, aggregate row compatibility and serializer equivalence. A query-count test keeps user bootstrap at 20 queries before and after adding 40 resources and 40 Missions. This is a query-count result, not a measured production latency guarantee.
+
+After pushing this change, deploy the new commit on Render using `pip install -r requirements.txt` and `python render_start.py`. If automatic deployment is enabled, Render will pick up the main-branch commit. Reload the browser after deployment. No database reset or manual migration is required. Production response times still depend on Render instance resources and the network distance to Supabase.
