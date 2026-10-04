@@ -1,15 +1,16 @@
 """PostgreSQL connection pool utilities for hosted deployment.
 
-This module is intentionally separated from server.py so the database layer can
-be optimized without touching business logic.
+Keeps the old SQLite-shaped database API while reusing PostgreSQL connections.
 """
 
 import os
 
 try:
     from psycopg_pool import ConnectionPool
+    from psycopg.rows import dict_row
 except ImportError:
     ConnectionPool = None
+    dict_row = None
 
 
 _pool = None
@@ -17,34 +18,82 @@ _pool = None
 
 def get_pool():
     global _pool
-    if _pool is not None:
-        return _pool
-
-    if ConnectionPool is None:
-        raise RuntimeError("psycopg_pool is required for Supabase deployment")
-
-    dsn = os.environ.get("SUPABASE_DATABASE_URL", "").strip()
-    if not dsn:
-        raise RuntimeError("SUPABASE_DATABASE_URL is missing")
-
-    _pool = ConnectionPool(
-        conninfo=dsn,
-        min_size=2,
-        max_size=10,
-        timeout=30,
-    )
+    if _pool is None:
+        if ConnectionPool is None:
+            raise RuntimeError("psycopg_pool is required for Supabase deployment")
+        dsn = os.environ.get("SUPABASE_DATABASE_URL", "").strip()
+        if not dsn:
+            raise RuntimeError("SUPABASE_DATABASE_URL is missing")
+        _pool = ConnectionPool(
+            conninfo=dsn,
+            min_size=2,
+            max_size=10,
+            kwargs={"row_factory": dict_row},
+        )
     return _pool
 
 
-class PooledConnection:
-    """Small compatibility wrapper matching the old connection lifecycle."""
+class CursorAdapter:
+    def __init__(self, cursor):
+        self.cursor = cursor
+
+    def execute(self, statement, params=None):
+        statement = _translate(statement)
+        self.cursor.execute(statement, params or ())
+        return self
+
+    def fetchone(self):
+        row = self.cursor.fetchone()
+        return row
+
+    def fetchall(self):
+        return self.cursor.fetchall()
+
+
+class ConnectionAdapter:
+    def __init__(self, connection):
+        self.connection = connection
+
+    def execute(self, statement, params=None):
+        return CursorAdapter(self.connection.execute(_translate(statement), params or ()))
+
+    def cursor(self):
+        return CursorAdapter(self.connection.cursor())
+
+    def commit(self):
+        self.connection.commit()
+
+    def rollback(self):
+        self.connection.rollback()
+
+    def close(self):
+        self.connection.close()
 
     def __enter__(self):
-        self._connection = get_pool().connection()
-        return self._connection.__enter__()
+        return self
 
     def __exit__(self, exc_type, exc, tb):
-        return self._connection.__exit__(exc_type, exc, tb)
+        self.close()
+
+
+def _translate(statement):
+    out = []
+    quoted = False
+    for char in statement:
+        if char == "'":
+            quoted = not quoted
+        out.append("%s" if char == "?" and not quoted else char)
+    return "".join(out)
+
+
+class PooledConnection:
+    def __enter__(self):
+        self.connection = get_pool().connection()
+        self.connection.__enter__()
+        return ConnectionAdapter(self.connection)
+
+    def __exit__(self, exc_type, exc, tb):
+        return self.connection.__exit__(exc_type, exc, tb)
 
 
 def pooled_connection():
