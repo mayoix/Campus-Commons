@@ -954,13 +954,22 @@ def cookie_value(handler, name: str) -> str | None:
     return None
 
 
-def origin_ok(handler) -> bool:
+def origin_ok(handler):
     origin = handler.headers.get("Origin")
     if not origin:
         return True
+
     try:
-        parsed=urlparse(origin)
-        return parsed.scheme == "http" and parsed.hostname in ("127.0.0.1", "localhost")
+        parsed = urlparse(origin)
+
+        allowed_hosts = {
+            "localhost",
+            "127.0.0.1",
+            "https://campus-commons.onrender.com/",
+        }
+
+        return parsed.hostname in allowed_hosts
+
     except Exception:
         return False
 
